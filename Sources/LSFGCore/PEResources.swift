@@ -124,3 +124,41 @@ public enum PEFile {
         return out
     }
 }
+
+extension PEFile {
+    static let rtIcon: UInt32 = 3, rtGroupIcon: UInt32 = 14
+
+    /// The executable's main icon as an .ico file (readable by NSImage), or nil if it has none.
+    /// Windows stores it as a group (RT_GROUP_ICON) listing sizes, each image in its own RT_ICON.
+    public static func icon(in file: Data) throws -> Data? {
+        let resources = try resources(in: file)
+        var images: [UInt32: Data] = [:]
+        for r in resources {
+            if case .id(rtIcon) = r.type, case let .id(id) = r.name { images[id] = r.data }
+        }
+        guard let group = resources.first(where: { if case .id(rtGroupIcon) = $0.type { true } else { false } })?.data else {
+            return nil
+        }
+        let g = ByteReader(group)
+        let count = Int(try g.u16(4))
+        // GRPICONDIRENTRY (14 bytes): width, height, colors, reserved, planes(2), bits(2), size(4), id(2)
+        var entries: [(header: Data, image: Data)] = []
+        for i in 0..<count {
+            let e = 6 + 14 * i
+            guard let image = images[UInt32(try g.u16(e + 12))] else { continue }
+            entries.append((try g.bytes(e, 8), image))
+        }
+        guard !entries.isEmpty else { return nil }
+        // ICO: ICONDIR, then ICONDIRENTRY (16 bytes) per image with a file offset, then the images.
+        var ico = Data([0, 0, 1, 0, UInt8(entries.count & 0xFF), UInt8(entries.count >> 8)])
+        var offset = 6 + 16 * entries.count
+        for entry in entries {
+            ico.append(entry.header)
+            withUnsafeBytes(of: UInt32(entry.image.count).littleEndian) { ico.append(contentsOf: $0) }
+            withUnsafeBytes(of: UInt32(offset).littleEndian) { ico.append(contentsOf: $0) }
+            offset += entry.image.count
+        }
+        for entry in entries { ico.append(entry.image) }
+        return ico
+    }
+}

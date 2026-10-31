@@ -179,6 +179,19 @@ case "bake":
         fail("bake failed: \(error)")
     }
 
+case "icon":
+    // lsfg-metal icon GAME.exe OUT.ico (dev tool: checks icon extraction)
+    guard args.count >= 3 else { fail("usage: lsfg-metal icon GAME.exe OUT.ico") }
+    do {
+        guard let ico = try PEFile.icon(in: try Data(contentsOf: URL(fileURLWithPath: args[1]), options: .mappedIfSafe)) else {
+            fail("no icon")
+        }
+        try ico.write(to: URL(fileURLWithPath: args[2]))
+        print("wrote \(ico.count) bytes")
+    } catch {
+        fail("icon failed: \(error)")
+    }
+
 case "lift":
     // lsfg-metal lift FILE.spv OUT.spv: skeleton with weights replaced by spec constants (dev tool)
     guard args.count >= 3 else { fail("usage: lsfg-metal lift IN.spv OUT.spv") }
