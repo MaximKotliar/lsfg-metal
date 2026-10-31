@@ -10,6 +10,12 @@ public enum FrameIO {
         public let width: Int
         public let height: Int
         public var rgba: [UInt8]
+
+        public init(width: Int, height: Int, rgba: [UInt8]) {
+            self.width = width
+            self.height = height
+            self.rgba = rgba
+        }
     }
 
     public static func load(_ url: URL) throws -> Image {

@@ -12,6 +12,8 @@ commands:
   check               build a Metal pipeline for every translated kernel
   generate PREV NEXT -o OUT.png [--multiplier N] [--flow-scale F] [--fp32] [--performance] [--runs N]
                       write the frame(s) between two images using LSFG 3.1 on Metal
+  eval VIDEO|DIR [--start S] [--count N] [--max-width W] [--flow-scale F] [--performance] [--samples DIR]
+                      score generated frames against a real recording (every other frame is held out)
   bench PREV NEXT [--frames N] [--sizes WxH,...]
                       sustained benchmark across sizes, modes, flow scales and multipliers
 
@@ -192,6 +194,33 @@ case "bench":
         }
     } catch {
         fail("bench failed: \(error)")
+    }
+
+case "eval":
+    // lsfg-metal eval VIDEO|DIR [--start S] [--count N] [--max-width W] [--flow-scale F] [--performance] [--samples DIR]
+    guard args.count >= 2 else { fail("usage: lsfg-metal eval VIDEO|FRAME_DIR [--start S] [--count N] [--max-width W] [--flow-scale F] [--performance] [--samples DIR]") }
+    func value(_ flag: String) -> String? { args.firstIndex(of: flag).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
+    var opts = EvalOptions()
+    opts.start = value("--start").flatMap(Double.init) ?? 0
+    opts.count = value("--count").flatMap(Int.init) ?? 121
+    opts.maxWidth = value("--max-width").flatMap(Int.init) ?? 1920
+    opts.settings.flowScale = value("--flow-scale").flatMap(Float.init) ?? 1.0
+    opts.settings.performance = args.contains("--performance")
+    opts.samples = value("--samples").map { URL(fileURLWithPath: $0) }
+    do {
+        let raw = try await loadFrames(from: URL(fileURLWithPath: args[1]), options: opts)
+        let (frames, dropped) = dropDuplicates(raw)
+        guard frames.count >= 7 else { fail("need at least 7 distinct frames, got \(frames.count)") }
+        let span = (raw.last!.time - raw.first!.time)
+        print(String(format: "%d frames decoded (%.1f fps source), %d duplicates dropped, %dx%d",
+                     raw.count, Double(raw.count - 1) / max(span, 0.001), dropped, frames[0].image.width, frames[0].image.height))
+        let kernels = try LSFGKernels(cacheDirectory: try LSFGKernels.cacheDirectory(forDLL: resolveDLL(args)),
+                                      ids: LSFG31Shaders.allIDs(fp16: true, performance: opts.settings.performance))
+        let scores = try evaluate(frames: frames, options: opts, kernels: kernels)
+        report(scores, label: String(format: "%@, flow %.2f", opts.settings.performance ? "performance" : "quality",
+                                     opts.settings.flowScale))
+    } catch {
+        fail("eval failed: \(error)")
     }
 
 default:
