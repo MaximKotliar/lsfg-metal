@@ -62,3 +62,20 @@ public enum FrameIO {
         return img
     }
 }
+
+extension FrameIO {
+    /// Nearest-neighbour resize, good enough for benchmark inputs.
+    public static func resized(_ img: Image, width: Int, height: Int) -> Image {
+        if img.width == width && img.height == height { return img }
+        var out = [UInt8](repeating: 255, count: width * height * 4)
+        for y in 0..<height {
+            let sy = y * img.height / height
+            for x in 0..<width {
+                let sx = x * img.width / width
+                let s = (sy * img.width + sx) * 4, d = (y * width + x) * 4
+                out[d] = img.rgba[s]; out[d + 1] = img.rgba[s + 1]; out[d + 2] = img.rgba[s + 2]
+            }
+        }
+        return Image(width: width, height: height, rgba: out)
+    }
+}

@@ -10,19 +10,23 @@ public struct LSFGSettings: Sendable {
     public var hdr: Bool = false
     /// Use the DLL's fp16 shader variants (recommended on Apple GPUs).
     public var fp16: Bool = true
+    /// LSFG 3.1 performance mode: half the feature channels, faster and slightly softer.
+    public var performance: Bool = false
 
     public init() {}
 
     public var generationCount: Int { max(1, multiplier - 1) }
 }
 
-/// Resource IDs of the LSFG 3.1 (quality) shaders in Lossless.dll.
+/// Resource IDs of the LSFG 3.1 shaders in Lossless.dll.
 ///
 /// The layout of this table, the pass graph and the constant-buffer contents below follow
 /// lsfg-vk's framegen/v3.1 (MIT License, Copyright (c) 2025 lsfg-vk,
 /// https://github.com/PancakeTAS/lsfg-vk at its MIT-licensed revisions).
 public enum LSFG31Shaders {
-    /// Base indices; the DLL stores fp16 variants at base + 49 and fp32 at base + 98.
+    /// Base indices. The DLL stores quality-mode shaders at base + 49 (fp16) and base + 98 (fp32),
+    /// and performance-mode shaders at base + 72 (fp16) and base + 121 (fp32).
+    /// Mipmaps and generate are shared by both modes.
     static let base: [String: UInt32] = [
         "mipmaps": 255, "generate": 256,
         "alpha0": 267, "alpha1": 268, "alpha2": 269, "alpha3": 270,
@@ -32,9 +36,14 @@ public enum LSFG31Shaders {
         "delta5": 258, "delta6": 271, "delta7": 272, "delta8": 273, "delta9": 274,
     ]
 
-    static func id(_ name: String, fp16: Bool) -> UInt32 { base[name]! + (fp16 ? 49 : 98) }
+    static func id(_ name: String, fp16: Bool, performance: Bool) -> UInt32 {
+        let shared = name == "mipmaps" || name == "generate"
+        return base[name]! + (performance && !shared ? 72 : 49) + (fp16 ? 0 : 49)
+    }
 
-    public static func allIDs(fp16: Bool) -> Set<UInt32> { Set(base.keys.map { id($0, fp16: fp16) }) }
+    public static func allIDs(fp16: Bool, performance: Bool) -> Set<UInt32> {
+        Set(base.keys.map { id($0, fp16: fp16, performance: performance) })
+    }
 }
 
 /// LSFG 3.1 frame generation on Metal.
@@ -67,6 +76,19 @@ public struct LSFG31 {
     private struct Beta { let temp1: [MTLTexture], temp2: [MTLTexture], out: [MTLTexture] }
     private struct Gamma { let temp1: [MTLTexture], temp2: [MTLTexture], out: MTLTexture }
     private struct Delta { let temp1: [MTLTexture], temp2: [MTLTexture], out1: MTLTexture, out2: MTLTexture }
+
+    /// GPU memory held by all of this context's textures, in bytes.
+    public var memoryFootprint: Int {
+        var all: [MTLTexture] = inputs + outputs + mips + [dummy]
+        for a in alpha { all += a.temp1 + a.temp2 + a.temp3 + a.out.flatMap { $0 } }
+        all += beta.temp1 + beta.temp2 + beta.out
+        for g in gamma { all += g.temp1 + g.temp2 + [g.out] }
+        for d in delta { all += d.temp1 + d.temp2 + [d.out1, d.out2] }
+        return all.reduce(0) { $0 + $1.allocatedSize }
+    }
+
+    /// Number of compute dispatches per real frame.
+    public var dispatchesPerFrame: Int { 1 + 7 * 4 + 5 + settings.generationCount * (7 * 5 + 3 * 10 + 1) }
 
     /// The texture the next real frame must be written into before `encode`.
     public var nextInput: MTLTexture { inputs[Int(frameIndex % 2)] }
@@ -101,11 +123,13 @@ public struct LSFG31 {
         let flowW = Int(Float(width) / invScale), flowH = Int(Float(height) / invScale)
         mips = try (0..<7).map { try tex(flowW >> $0, flowH >> $0, .r8Unorm) }
 
+        // Feature channels per pyramid level: 4 textures in quality mode, 2 in performance mode.
+        let w = settings.performance ? 2 : 4
         let alpha = try mips.map { mip in
             let hw = (mip.width + 1) >> 1, hh = (mip.height + 1) >> 1
             let qw = (hw + 1) >> 1, qh = (hh + 1) >> 1
-            return Alpha(temp1: try texs(2, hw, hh), temp2: try texs(2, hw, hh), temp3: try texs(4, qw, qh),
-                         out: try (0..<3).map { _ in try texs(4, qw, qh) })
+            return Alpha(temp1: try texs(w / 2, hw, hh), temp2: try texs(w / 2, hw, hh), temp3: try texs(w, qw, qh),
+                         out: try (0..<3).map { _ in try texs(w, qw, qh) })
         }
 
         self.alpha = alpha
@@ -115,12 +139,12 @@ public struct LSFG31 {
 
         gamma = try (0..<7).map { i in
             let e = alpha[6 - i].out[0][0]
-            return Gamma(temp1: try texs(4, e.width, e.height), temp2: try texs(4, e.width, e.height),
+            return Gamma(temp1: try texs(max(3, w), e.width, e.height), temp2: try texs(w, e.width, e.height),
                          out: try tex(e.width, e.height, .rgba16Float))
         }
         delta = try (4..<7).map { i in
             let e = alpha[6 - i].out[0][0]
-            return Delta(temp1: try texs(4, e.width, e.height), temp2: try texs(4, e.width, e.height),
+            return Delta(temp1: try texs(max(3, w), e.width, e.height), temp2: try texs(w, e.width, e.height),
                          out1: try tex(e.width, e.height, .rgba16Float), out2: try tex(e.width, e.height, .rgba16Float))
         }
 
@@ -159,12 +183,13 @@ public struct LSFG31 {
         let enc: MTLComputeCommandEncoder
         let kernels: LSFGKernels
         let fp16: Bool
+        let performance: Bool
         let dummy: MTLTexture
 
         func dispatch(_ name: String, constants: [UInt32]? = nil, samplers: [MTLSamplerState],
                       inputs: [MTLTexture?], outputs: [MTLTexture], groups: (Int, Int)) {
             precondition(inputs.count <= 16 && outputs.count <= 15, "binding table overflow in \(name)")
-            let k = kernels[LSFG31Shaders.id(name, fp16: fp16)]
+            let k = kernels[LSFG31Shaders.id(name, fp16: fp16, performance: performance)]
             enc.label = name
             enc.setComputePipelineState(k.pipeline)
             if var c = constants { enc.setBytes(&c, length: c.count * 4, index: 0) }
@@ -187,7 +212,7 @@ public struct LSFG31 {
     /// With `generate: false` only the analysis passes run, which is enough to warm up history.
     public mutating func encode(into commandBuffer: MTLCommandBuffer, generate: Bool = true) throws {
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { throw LSFGError.metal("compute encoder") }
-        let e = Encoder(enc: enc, kernels: kernels, fp16: settings.fp16, dummy: dummy)
+        let e = Encoder(enc: enc, kernels: kernels, fp16: settings.fp16, performance: settings.performance, dummy: dummy)
         let fc = Int(frameIndex % 6) // 6 covers both the %2 and %3 rotations
 
         // 1. Pyramid and per-level features for the new frame.
@@ -238,8 +263,9 @@ public struct LSFG31 {
         e.dispatch("gamma0", constants: c, samplers: [samplerWhite, samplerEdge],
                    inputs: opt(aOut[(fc + 2) % 3] + aOut[fc % 3]) + [prev], outputs: Array(g.temp1[0..<3]), groups: grid)
         e.dispatch("gamma1", samplers: [samplerBlack], inputs: Array(g.temp1[0..<3]), outputs: g.temp2, groups: grid)
-        e.dispatch("gamma2", samplers: [samplerBlack], inputs: g.temp2, outputs: g.temp1, groups: grid)
-        e.dispatch("gamma3", samplers: [samplerBlack], inputs: g.temp1, outputs: g.temp2, groups: grid)
+        let w = g.temp2.count
+        e.dispatch("gamma2", samplers: [samplerBlack], inputs: g.temp2, outputs: Array(g.temp1[0..<w]), groups: grid)
+        e.dispatch("gamma3", samplers: [samplerBlack], inputs: Array(g.temp1[0..<w]), outputs: g.temp2, groups: grid)
         e.dispatch("gamma4", constants: c, samplers: [samplerBlack, samplerEdge],
                    inputs: opt(g.temp2) + [prev, beta.out[min(6 - i, 5)]], outputs: [g.out], groups: grid)
     }
@@ -256,16 +282,17 @@ public struct LSFG31 {
         e.dispatch("delta0", constants: c, samplers: [samplerWhite, samplerEdge],
                    inputs: history + [opt1], outputs: Array(d.temp1[0..<3]), groups: grid)
         e.dispatch("delta1", samplers: [samplerBlack], inputs: Array(d.temp1[0..<3]), outputs: d.temp2, groups: grid)
-        e.dispatch("delta2", samplers: [samplerBlack], inputs: d.temp2, outputs: d.temp1, groups: grid)
-        e.dispatch("delta3", samplers: [samplerBlack], inputs: d.temp1, outputs: d.temp2, groups: grid)
+        let w = d.temp2.count, h = w / 2
+        e.dispatch("delta2", samplers: [samplerBlack], inputs: d.temp2, outputs: Array(d.temp1[0..<w]), groups: grid)
+        e.dispatch("delta3", samplers: [samplerBlack], inputs: Array(d.temp1[0..<w]), outputs: d.temp2, groups: grid)
         e.dispatch("delta4", constants: c, samplers: [samplerBlack, samplerEdge],
                    inputs: opt(d.temp2) + [opt1, beta.out[6 - i]], outputs: [d.out1], groups: grid)
         e.dispatch("delta5", constants: c, samplers: [samplerWhite, samplerEdge],
-                   inputs: history + [opt1, opt2], outputs: Array(d.temp2[0..<2]), groups: grid)
-        e.dispatch("delta6", samplers: [samplerBlack], inputs: Array(d.temp2[0..<2]), outputs: Array(d.temp1[0..<2]), groups: grid)
-        e.dispatch("delta7", samplers: [samplerBlack], inputs: Array(d.temp1[0..<2]), outputs: Array(d.temp2[0..<2]), groups: grid)
-        e.dispatch("delta8", samplers: [samplerBlack], inputs: Array(d.temp2[0..<2]), outputs: Array(d.temp1[0..<2]), groups: grid)
+                   inputs: history + [opt1, opt2], outputs: Array(d.temp2[0..<h]), groups: grid)
+        e.dispatch("delta6", samplers: [samplerBlack], inputs: Array(d.temp2[0..<h]), outputs: Array(d.temp1[0..<h]), groups: grid)
+        e.dispatch("delta7", samplers: [samplerBlack], inputs: Array(d.temp1[0..<h]), outputs: Array(d.temp2[0..<h]), groups: grid)
+        e.dispatch("delta8", samplers: [samplerBlack], inputs: Array(d.temp2[0..<h]), outputs: Array(d.temp1[0..<h]), groups: grid)
         e.dispatch("delta9", constants: c, samplers: [samplerBlack, samplerEdge],
-                   inputs: opt(Array(d.temp1[0..<2])) + [opt3], outputs: [d.out2], groups: grid)
+                   inputs: opt(Array(d.temp1[0..<h])) + [opt3], outputs: [d.out2], groups: grid)
     }
 }

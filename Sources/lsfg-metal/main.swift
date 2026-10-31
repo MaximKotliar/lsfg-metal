@@ -10,8 +10,10 @@ commands:
                       add --verbose for per-binding detail
   dump --out DIR      write the shaders as .dxbc / .spv files (keep DIR outside the repo)
   check               build a Metal pipeline for every translated kernel
-  generate PREV NEXT -o OUT.png [--multiplier N] [--flow-scale F] [--fp32] [--runs N]
+  generate PREV NEXT -o OUT.png [--multiplier N] [--flow-scale F] [--fp32] [--performance] [--runs N]
                       write the frame(s) between two images using LSFG 3.1 on Metal
+  bench PREV NEXT [--frames N] [--sizes WxH,...]
+                      sustained benchmark across sizes, modes, flow scales and multipliers
 
 environment:
   LSFG_BOTTLES  extra bottle folders to scan, colon-separated
@@ -98,18 +100,19 @@ case "check":
     }
 
 case "generate":
-    // lsfg-metal generate PREV NEXT -o OUT [--multiplier N] [--flow-scale F] [--fp32] [--runs N]
+    // lsfg-metal generate PREV NEXT -o OUT [--multiplier N] [--flow-scale F] [--fp32] [--performance] [--runs N]
     let positional = args.dropFirst().enumerated().filter { i, a in
         !a.hasPrefix("-") && (i == 0 || !["-o", "--multiplier", "--flow-scale", "--dll", "--runs"].contains(args[i]))
     }.map(\.1)
     guard positional.count == 2, let o = args.firstIndex(of: "-o"), o + 1 < args.count else {
-        fail("usage: lsfg-metal generate PREV NEXT -o OUT.png [--multiplier N] [--flow-scale F] [--fp32] [--runs N]")
+        fail("usage: lsfg-metal generate PREV NEXT -o OUT.png [--multiplier N] [--flow-scale F] [--fp32] [--performance] [--runs N]")
     }
     func value(_ flag: String) -> String? { args.firstIndex(of: flag).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
     var settings = LSFGSettings()
     settings.multiplier = value("--multiplier").flatMap(Int.init) ?? 2
     settings.flowScale = value("--flow-scale").flatMap(Float.init) ?? 1.0
     settings.fp16 = !args.contains("--fp32")
+    settings.performance = args.contains("--performance")
     let runs = max(1, value("--runs").flatMap(Int.init) ?? 1)
     guard (2...8).contains(settings.multiplier), (0.25...1.0).contains(settings.flowScale) else {
         fail("--multiplier must be 2...8 and --flow-scale 0.25...1.0")
@@ -121,7 +124,7 @@ case "generate":
 
         let loadStart = Date()
         let kernels = try LSFGKernels(cacheDirectory: try LSFGKernels.cacheDirectory(forDLL: resolveDLL(args)),
-                                      ids: LSFG31Shaders.allIDs(fp16: settings.fp16))
+                                      ids: LSFG31Shaders.allIDs(fp16: settings.fp16, performance: settings.performance))
         let loadTime = Date().timeIntervalSince(loadStart)
         var lsfg = try LSFG31(width: prev.width, height: prev.height, settings: settings, kernels: kernels)
         guard let queue = kernels.device.makeCommandQueue() else { fail("no command queue") }
@@ -153,11 +156,42 @@ case "generate":
             print("wrote \(url.path)")
         }
         let sorted = times.sorted()
-        print(String(format: "%dx%d, %d generated, flow %.2f, %@: pipelines %.2fs, GPU %.2f ms (median of %d)",
+        print(String(format: "%dx%d, %d generated, flow %.2f, %@, %@: pipelines %.2fs, GPU %.2f ms (median of %d)",
                      prev.width, prev.height, settings.generationCount, settings.flowScale,
-                     settings.fp16 ? "fp16" : "fp32", loadTime, sorted[sorted.count / 2], runs))
+                     settings.fp16 ? "fp16" : "fp32", settings.performance ? "performance" : "quality", loadTime, sorted[sorted.count / 2], runs))
     } catch {
         fail("generate failed: \(error)")
+    }
+
+case "bench":
+    // lsfg-metal bench PREV NEXT [--frames N] [--sizes 1280x720,1920x1080,...]
+    guard args.count >= 3 else { fail("usage: lsfg-metal bench PREV NEXT [--frames N] [--sizes WxH,...]") }
+    func value(_ flag: String) -> String? { args.firstIndex(of: flag).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
+    let frames = value("--frames").flatMap(Int.init) ?? 300
+    let sizes = (value("--sizes") ?? "1280x720,1920x1080,2560x1440,3840x2160").split(separator: ",").map {
+        let p = $0.split(separator: "x").compactMap { Int($0) }; return (p[0], p[1])
+    }
+    do {
+        let a = try FrameIO.load(URL(fileURLWithPath: args[1])), b = try FrameIO.load(URL(fileURLWithPath: args[2]))
+        let dir = try LSFGKernels.cacheDirectory(forDLL: resolveDLL(args))
+        let kernels = try LSFGKernels(cacheDirectory: dir, ids: LSFG31Shaders.allIDs(fp16: true, performance: false)
+                                          .union(LSFG31Shaders.allIDs(fp16: true, performance: true)))
+        print("device: \(kernels.device.name), \(frames) frames per row, 3 in flight, fp16\n")
+        print("size       mode  flow  mult  GPU med  GPU p95  CPU enc  max fps  mem MB  dispatches")
+        for (w, h) in sizes {
+            let pa = FrameIO.resized(a, width: w, height: h), pb = FrameIO.resized(b, width: w, height: h)
+            for perf in [false, true] { for flow in [Float(1.0), 0.5] { for mult in [2, 3, 4] {
+                if mult > 2 && flow != 0.5 { continue }
+                var s = LSFGSettings()
+                s.performance = perf; s.flowScale = flow; s.multiplier = mult
+                let r = try runBench(prev: pa, next: pb, settings: s, kernels: kernels, frames: frames)
+                print(String(format: "%-10@ %-5@ %4.2f  %4d  %6.2f   %6.2f   %6.3f   %7.0f  %6.0f  %d",
+                             "\(w)x\(h)" as NSString, (perf ? "perf" : "qual") as NSString, flow, mult,
+                             r.gpuMedian, r.gpuP95, r.cpuEncode, r.throughputFPS, r.memoryMB, r.dispatches))
+            } } }
+        }
+    } catch {
+        fail("bench failed: \(error)")
     }
 
 default:
