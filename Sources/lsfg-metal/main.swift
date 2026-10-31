@@ -104,7 +104,7 @@ case "check":
 case "generate":
     // lsfg-metal generate PREV NEXT -o OUT [--multiplier N] [--flow-scale F] [--fp32] [--performance] [--runs N]
     let positional = args.dropFirst().enumerated().filter { i, a in
-        !a.hasPrefix("-") && (i == 0 || !["-o", "--multiplier", "--flow-scale", "--dll", "--runs"].contains(args[i]))
+        !a.hasPrefix("-") && (i == 0 || !["-o", "--multiplier", "--flow-scale", "--dll", "--runs", "--baked"].contains(args[i]))
     }.map(\.1)
     guard positional.count == 2, let o = args.firstIndex(of: "-o"), o + 1 < args.count else {
         fail("usage: lsfg-metal generate PREV NEXT -o OUT.png [--multiplier N] [--flow-scale F] [--fp32] [--performance] [--runs N]")
@@ -125,8 +125,9 @@ case "generate":
         guard prev.width == next.width, prev.height == next.height else { fail("frames must be the same size") }
 
         let loadStart = Date()
-        let kernels = try LSFGKernels(cacheDirectory: try LSFGKernels.cacheDirectory(forDLL: resolveDLL(args)),
-                                      ids: LSFG31Shaders.allIDs(fp16: settings.fp16, performance: settings.performance))
+        let ids = LSFG31Shaders.allIDs(fp16: settings.fp16, performance: settings.performance)
+        let kernels = try value("--baked").map { try LSFGKernels(bakedDirectory: URL(fileURLWithPath: $0), dll: resolveDLL(args), ids: ids) }
+            ?? LSFGKernels(cacheDirectory: try LSFGKernels.cacheDirectory(forDLL: resolveDLL(args)), ids: ids)
         let loadTime = Date().timeIntervalSince(loadStart)
         var lsfg = try LSFG31(width: prev.width, height: prev.height, settings: settings, kernels: kernels)
         guard let queue = kernels.device.makeCommandQueue() else { fail("no command queue") }
@@ -165,6 +166,30 @@ case "generate":
         fail("generate failed: \(error)")
     }
 
+case "bake":
+    // lsfg-metal bake --out DIR: pre-baked kernels without weights (see Bake.swift)
+    guard let o = args.firstIndex(of: "--out"), o + 1 < args.count else { fail("usage: lsfg-metal bake --out DIR") }
+    do {
+        let out = URL(fileURLWithPath: args[o + 1])
+        try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+        let start = Date()
+        let count = try bake(dll: resolveDLL(args), out: out)
+        print(String(format: "baked %d kernels into %@ in %.1fs", count, out.path, Date().timeIntervalSince(start)))
+    } catch {
+        fail("bake failed: \(error)")
+    }
+
+case "lift":
+    // lsfg-metal lift FILE.spv OUT.spv: skeleton with weights replaced by spec constants (dev tool)
+    guard args.count >= 3 else { fail("usage: lsfg-metal lift IN.spv OUT.spv") }
+    do {
+        let lifted = try SPIRVConstants.lift(try Data(contentsOf: URL(fileURLWithPath: args[1])))
+        try lifted.skeleton.write(to: URL(fileURLWithPath: args[2]))
+        print("\(lifted.constants.count) constants lifted, structure \(lifted.structureHash.prefix(16))")
+    } catch {
+        fail("lift failed: \(error)")
+    }
+
 case "profile":
     // lsfg-metal profile PREV NEXT [--size WxH] [--performance] [--flow-scale F] [--frames N]
     guard args.count >= 3 else { fail("usage: lsfg-metal profile PREV NEXT [--size WxH] [--performance] [--flow-scale F] [--frames N]") }
@@ -201,8 +226,9 @@ case "bench":
     do {
         let a = try FrameIO.load(URL(fileURLWithPath: args[1])), b = try FrameIO.load(URL(fileURLWithPath: args[2]))
         let dir = try LSFGKernels.cacheDirectory(forDLL: resolveDLL(args))
-        let kernels = try LSFGKernels(cacheDirectory: dir, ids: LSFG31Shaders.allIDs(fp16: true, performance: false)
-                                          .union(LSFG31Shaders.allIDs(fp16: true, performance: true)))
+        let ids = LSFG31Shaders.allIDs(fp16: true, performance: false).union(LSFG31Shaders.allIDs(fp16: true, performance: true))
+        let kernels = try value("--baked").map { try LSFGKernels(bakedDirectory: URL(fileURLWithPath: $0), dll: resolveDLL(args), ids: ids) }
+            ?? LSFGKernels(cacheDirectory: dir, ids: ids)
         print("device: \(kernels.device.name), \(frames) frames per row, 3 in flight, fp16\n")
         print("size       mode  flow  mult  GPU med  GPU p95  CPU enc  max fps  mem MB  dispatches")
         for (w, h) in sizes {

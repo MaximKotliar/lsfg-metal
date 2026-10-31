@@ -21,6 +21,13 @@ private func opaque(_ o: AnyObject) -> UnsafeRawPointer {
     UnsafeRawPointer(Unmanaged.passUnretained(o).toOpaque())
 }
 
+/// Folder this library was loaded from.
+private func ownDirectory() -> URL {
+    var info = Dl_info()
+    guard dladdr(#dsohandle, &info) != 0, let path = info.dli_fname else { return URL(fileURLWithPath: ".") }
+    return URL(fileURLWithPath: String(cString: path)).deletingLastPathComponent()
+}
+
 private func writeError(_ message: String, _ buffer: UnsafeMutablePointer<CChar>?, _ length: Int32) {
     guard let buffer, length > 0 else { return }
     let bytes = Array(message.utf8.prefix(Int(length) - 1))
@@ -54,9 +61,17 @@ public func lsfg_bridge_create(_ device: UnsafeRawPointer, _ width: Int32, _ hei
             writeError("unknown pixel format \(pixelFormat)", errorBuffer, errorLength)
             return nil
         }
-        let kernels = try LSFGKernels(cacheDirectory: try LSFGKernels.cacheDirectory(forDLL: dll),
-                                      ids: LSFG31Shaders.allIDs(fp16: settings.fp16, performance: settings.performance),
-                                      device: device)
+        // Prefer the pre-baked kernels shipped next to this library (weights come from the DLL);
+        // fall back to kernels translated on this Mac if the DLL's shaders don't match them.
+        let ids = LSFG31Shaders.allIDs(fp16: settings.fp16, performance: settings.performance)
+        let baked = ownDirectory().appending(path: "baked")
+        let kernels: LSFGKernels
+        if FileManager.default.fileExists(atPath: baked.appending(path: LSFGKernels.manifestName).path),
+           let prebuilt = try? LSFGKernels(bakedDirectory: baked, dll: dll, ids: ids, device: device) {
+            kernels = prebuilt
+        } else {
+            kernels = try LSFGKernels(cacheDirectory: try LSFGKernels.cacheDirectory(forDLL: dll), ids: ids, device: device)
+        }
         let lsfg = try LSFG31(width: Int(width), height: Int(height), format: format, settings: settings, kernels: kernels)
         return Unmanaged.passRetained(Context(lsfg: lsfg)).toOpaque()
     } catch {

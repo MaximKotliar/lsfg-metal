@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import Synchronization
 
 /// Compute pipelines built from the translated metallib (see scripts/translate-shaders.sh).
 public struct LSFGKernels: @unchecked Sendable {
@@ -51,7 +52,102 @@ public struct LSFGKernels: @unchecked Sendable {
         self.kernels = kernels
     }
 
+    private init(device: MTLDevice, kernels: [UInt32: Kernel]) {
+        self.device = device
+        self.kernels = kernels
+    }
+
     public subscript(id: UInt32) -> Kernel { kernels[id]! }
+}
+
+// MARK: - Pre-baked kernels
+
+/// Describes a pre-baked skeleton library: per kernel, the structure hash it was baked from, how
+/// many constants it takes and its threadgroup size. Contains no weights.
+public struct BakedManifest: Codable, Sendable {
+    public struct Entry: Codable, Sendable {
+        public var hash: String
+        public var constants: Int
+        public var group: [Int]
+
+        public init(hash: String, constants: Int, group: [Int]) {
+            self.hash = hash
+            self.constants = constants
+            self.group = group
+        }
+    }
+
+    public var version = 1
+    public var kernels: [String: Entry] = [:]
+
+    public init() {}
+}
+
+extension LSFGKernels {
+    public static let skeletonLibraryName = "lsfg-skeleton.metallib"
+    public static let manifestName = "manifest.json"
+
+    public static func loadManifest(_ bakedDirectory: URL) throws -> BakedManifest {
+        try JSONDecoder().decode(BakedManifest.self, from: Data(contentsOf: bakedDirectory.appending(path: manifestName)))
+    }
+
+    /// The kernels in `ids` whose structure in the user's DLL differs from the baked skeleton
+    /// (for example after a Lossless Scaling update). Empty means the baked library fits.
+    public static func bakedMismatches(bakedDirectory: URL, dll: URL, ids: Set<UInt32>) throws -> [UInt32] {
+        let manifest = try loadManifest(bakedDirectory)
+        let spirv = try LSFGShaderLibrary(dll: dll).spirv
+        return try ids.sorted().filter { id in
+            guard let entry = manifest.kernels[String(id)], let code = spirv[id] else { return true }
+            return try SPIRVConstants.lift(code).structureHash != entry.hash
+        }
+    }
+
+    /// Builds pipelines from the pre-baked skeleton, specialized with the constants (weights)
+    /// from the user's own Lossless.dll. Throws if any kernel's structure doesn't match.
+    public init(bakedDirectory: URL, dll: URL, ids: Set<UInt32>,
+                device: MTLDevice? = MTLCreateSystemDefaultDevice()) throws {
+        guard let device else { throw LSFGError.metal("no Metal device") }
+        let manifest = try Self.loadManifest(bakedDirectory)
+        let library = try device.makeLibrary(URL: bakedDirectory.appending(path: Self.skeletonLibraryName))
+        let spirv = try LSFGShaderLibrary(dll: dll).spirv
+
+        // Lift first (cheap, serial), so a mismatch fails before any compiling.
+        var jobs: [(id: UInt32, constants: [SPIRVConstants.Constant], group: MTLSize)] = []
+        for id in ids.sorted() {
+            guard let entry = manifest.kernels[String(id)], let code = spirv[id] else {
+                throw LSFGError.metal("kernel \(id) is missing from the baked library or the DLL")
+            }
+            let lifted = try SPIRVConstants.lift(code)
+            guard lifted.structureHash == entry.hash, lifted.constants.count == entry.constants, entry.group.count == 3 else {
+                throw LSFGError.metal("kernel \(id) in this Lossless.dll doesn't match the baked library")
+            }
+            jobs.append((id, lifted.constants, MTLSize(width: entry.group[0], height: entry.group[1], depth: entry.group[2])))
+        }
+
+        // Specializing compiles each kernel for this GPU; do them in parallel. Metal caches the
+        // results, so later launches are quick.
+        let built = Mutex<[UInt32: Kernel]>([:])
+        let failure = Mutex<String?>(nil)
+        DispatchQueue.concurrentPerform(iterations: jobs.count) { i in
+            let job = jobs[i]
+            let values = MTLFunctionConstantValues()
+            for (k, c) in job.constants.enumerated() {
+                switch c.kind {
+                case .half: var bits = UInt16(c.bits); values.setConstantValue(&bits, type: .half, index: k)
+                case .float: var bits = c.bits; values.setConstantValue(&bits, type: .float, index: k)
+                }
+            }
+            do {
+                let fn = try library.makeFunction(name: "lsfg_\(job.id)", constantValues: values)
+                let pipeline = try device.makeComputePipelineState(function: fn)
+                built.withLock { $0[job.id] = Kernel(pipeline: pipeline, threadgroupSize: job.group) }
+            } catch {
+                failure.withLock { $0 = "kernel \(job.id): \(error)" }
+            }
+        }
+        if let message = failure.withLock({ $0 }) { throw LSFGError.metal(message) }
+        self.init(device: device, kernels: built.withLock { $0 })
+    }
 }
 
 public enum LSFGError: Error, CustomStringConvertible {
