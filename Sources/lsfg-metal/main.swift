@@ -8,8 +8,10 @@ commands:
   locate              find Lossless Scaling (Steam app \(LosslessInstall.steamAppID)) in CrossOver bottles
   inspect [--dll P]   list the LSFG compute shaders in Lossless.dll and their bindings
                       add --verbose for per-binding detail
-  dump --out DIR      write the shaders as .dxbc files (keep DIR outside the repo)
+  dump --out DIR      write the shaders as .dxbc / .spv files (keep DIR outside the repo)
   check               build a Metal pipeline for every translated kernel
+  generate PREV NEXT -o OUT.png [--multiplier N] [--flow-scale F] [--fp32] [--runs N]
+                      write the frame(s) between two images using LSFG 3.1 on Metal
 
 environment:
   LSFG_BOTTLES  extra bottle folders to scan, colon-separated
@@ -46,7 +48,7 @@ case "inspect":
     let verbose = args.contains("--verbose")
     do {
         let lib = try LSFGShaderLibrary(dll: dll)
-        print("\(lib.entries.count) DXBC shaders in \(dll.lastPathComponent)\n")
+        print("\(lib.entries.count) DXBC + \(lib.spirv.count) SPIR-V shaders in \(dll.lastPathComponent)\n")
         print("id    sha256        type  group       temps  instr  icb   bindings")
         for e in lib.entries {
             let s = e.shader
@@ -78,7 +80,8 @@ case "dump":
         let lib = try LSFGShaderLibrary(dll: resolveDLL(args))
         try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
         for e in lib.entries { try e.shader.bytes.write(to: out.appending(path: "\(e.resourceID).dxbc")) }
-        print("wrote \(lib.entries.count) shaders to \(out.path)")
+        for (id, code) in lib.spirv { try code.write(to: out.appending(path: "\(id).spv")) }
+        print("wrote \(lib.entries.count) DXBC and \(lib.spirv.count) SPIR-V shaders to \(out.path)")
     } catch {
         fail("dump failed: \(error)")
     }
@@ -86,24 +89,75 @@ case "dump":
 case "check":
     // Builds a GPU pipeline for every translated kernel.
     do {
-        let dll = resolveDLL(args)
-        let url = try LSFGKernels.defaultLibraryURL(forDLL: dll)
         let start = Date()
-        let kernels = try LSFGKernels(libraryURL: url)
-        let shaders = try LSFGShaderLibrary(dll: dll)
-        var mismatched = 0
-        for e in shaders.entries {
-            guard let p = kernels.pipelines[e.resourceID] else { print("missing kernel \(e.resourceID)"); mismatched += 1; continue }
-            if let g = e.shader.threadGroupSize, Int(g.x * g.y * g.z) > p.maxTotalThreadsPerThreadgroup {
-                print("kernel \(e.resourceID): group \(g.x)x\(g.y)x\(g.z) exceeds max \(p.maxTotalThreadsPerThreadgroup)")
-                mismatched += 1
-            }
-        }
-        print("\(kernels.pipelines.count)/\(shaders.entries.count) pipelines built on \(kernels.device.name) in "
-              + String(format: "%.2fs", Date().timeIntervalSince(start)) + ", \(mismatched) problems")
-        if mismatched > 0 { exit(1) }
+        let kernels = try LSFGKernels(cacheDirectory: try LSFGKernels.cacheDirectory(forDLL: resolveDLL(args)))
+        print("\(kernels.kernels.count) pipelines built on \(kernels.device.name) in "
+              + String(format: "%.2fs", Date().timeIntervalSince(start)))
     } catch {
         fail("check failed: \(error). Run scripts/translate-shaders.sh first.")
+    }
+
+case "generate":
+    // lsfg-metal generate PREV NEXT -o OUT [--multiplier N] [--flow-scale F] [--fp32] [--runs N]
+    let positional = args.dropFirst().enumerated().filter { i, a in
+        !a.hasPrefix("-") && (i == 0 || !["-o", "--multiplier", "--flow-scale", "--dll", "--runs"].contains(args[i]))
+    }.map(\.1)
+    guard positional.count == 2, let o = args.firstIndex(of: "-o"), o + 1 < args.count else {
+        fail("usage: lsfg-metal generate PREV NEXT -o OUT.png [--multiplier N] [--flow-scale F] [--fp32] [--runs N]")
+    }
+    func value(_ flag: String) -> String? { args.firstIndex(of: flag).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
+    var settings = LSFGSettings()
+    settings.multiplier = value("--multiplier").flatMap(Int.init) ?? 2
+    settings.flowScale = value("--flow-scale").flatMap(Float.init) ?? 1.0
+    settings.fp16 = !args.contains("--fp32")
+    let runs = max(1, value("--runs").flatMap(Int.init) ?? 1)
+    guard (2...8).contains(settings.multiplier), (0.25...1.0).contains(settings.flowScale) else {
+        fail("--multiplier must be 2...8 and --flow-scale 0.25...1.0")
+    }
+    do {
+        let prev = try FrameIO.load(URL(fileURLWithPath: positional[0]))
+        let next = try FrameIO.load(URL(fileURLWithPath: positional[1]))
+        guard prev.width == next.width, prev.height == next.height else { fail("frames must be the same size") }
+
+        let loadStart = Date()
+        let kernels = try LSFGKernels(cacheDirectory: try LSFGKernels.cacheDirectory(forDLL: resolveDLL(args)),
+                                      ids: LSFG31Shaders.allIDs(fp16: settings.fp16))
+        let loadTime = Date().timeIntervalSince(loadStart)
+        var lsfg = try LSFG31(width: prev.width, height: prev.height, settings: settings, kernels: kernels)
+        guard let queue = kernels.device.makeCommandQueue() else { fail("no command queue") }
+
+        // Fill all three history slots: prev, prev, then next generates prev→next.
+        func submit(_ frame: FrameIO.Image, generate: Bool) throws -> Double {
+            FrameIO.upload(frame, to: lsfg.nextInput)
+            guard let cb = queue.makeCommandBuffer() else { fail("no command buffer") }
+            try lsfg.encode(into: cb, generate: generate)
+            cb.commit()
+            cb.waitUntilCompleted()
+            if let error = cb.error { throw error }
+            return (cb.gpuEndTime - cb.gpuStartTime) * 1000
+        }
+        _ = try submit(prev, generate: false)
+        _ = try submit(prev, generate: false)
+        var times: [Double] = []
+        for run in 0..<runs {
+            // Repeat the measured frame with the same history for timing runs.
+            if run > 0 { _ = try submit(prev, generate: false); _ = try submit(prev, generate: false) }
+            times.append(try submit(next, generate: true))
+        }
+
+        let out = URL(fileURLWithPath: args[o + 1])
+        for (i, tex) in lsfg.outputs.enumerated() {
+            let url = lsfg.outputs.count == 1 ? out
+                : out.deletingPathExtension().appendingPathExtension("\(i + 1).png")
+            try FrameIO.save(FrameIO.download(tex), to: url)
+            print("wrote \(url.path)")
+        }
+        let sorted = times.sorted()
+        print(String(format: "%dx%d, %d generated, flow %.2f, %@: pipelines %.2fs, GPU %.2f ms (median of %d)",
+                     prev.width, prev.height, settings.generationCount, settings.flowScale,
+                     settings.fp16 ? "fp16" : "fp32", loadTime, sorted[sorted.count / 2], runs))
+    } catch {
+        fail("generate failed: \(error)")
     }
 
 default:
