@@ -179,8 +179,20 @@ public struct LSFG31 {
          0, 0, 0]
     }
 
+    /// Where dispatches go: one shared encoder, or (profiling) one command buffer per dispatch.
+    private final class Sink {
+        let shared: MTLComputeCommandEncoder?
+        let queue: MTLCommandQueue?
+        var profiled: [(name: String, commandBuffer: MTLCommandBuffer)] = []
+
+        init(shared: MTLComputeCommandEncoder?, queue: MTLCommandQueue?) {
+            self.shared = shared
+            self.queue = queue
+        }
+    }
+
     private struct Encoder {
-        let enc: MTLComputeCommandEncoder
+        let sink: Sink
         let kernels: LSFGKernels
         let fp16: Bool
         let performance: Bool
@@ -190,6 +202,14 @@ public struct LSFG31 {
                       inputs: [MTLTexture?], outputs: [MTLTexture], groups: (Int, Int)) {
             precondition(inputs.count <= 16 && outputs.count <= 15, "binding table overflow in \(name)")
             let k = kernels[LSFG31Shaders.id(name, fp16: fp16, performance: performance)]
+            var own: MTLCommandBuffer?
+            let enc: MTLComputeCommandEncoder
+            if let shared = sink.shared {
+                enc = shared
+            } else {
+                own = sink.queue!.makeCommandBuffer()!
+                enc = own!.makeComputeCommandEncoder()!
+            }
             enc.label = name
             enc.setComputePipelineState(k.pipeline)
             if var c = constants { enc.setBytes(&c, length: c.count * 4, index: 0) }
@@ -198,7 +218,16 @@ public struct LSFG31 {
             for (i, t) in outputs.enumerated() { enc.setTexture(t, index: 16 + i) }
             enc.dispatchThreadgroups(MTLSize(width: groups.0, height: groups.1, depth: 1),
                                      threadsPerThreadgroup: k.threadgroupSize)
+            if let own {
+                enc.endEncoding()
+                own.commit()
+                sink.profiled.append((name, own))
+            }
         }
+
+        /// Everything dispatched so far finishes (and its writes are visible) before anything after.
+        /// The shared encoder is concurrent, so passes between barriers may overlap on the GPU.
+        func barrier() { sink.shared?.memoryBarrier(scope: .textures) }
     }
 
     private func opt(_ t: [MTLTexture]) -> [MTLTexture?] { t.map { $0 } }
@@ -211,66 +240,105 @@ public struct LSFG31 {
     /// Encodes one real frame (already written to `nextInput`).
     /// With `generate: false` only the analysis passes run, which is enough to warm up history.
     public mutating func encode(into commandBuffer: MTLCommandBuffer, generate: Bool = true) throws {
-        guard let enc = commandBuffer.makeComputeCommandEncoder() else { throw LSFGError.metal("compute encoder") }
-        let e = Encoder(enc: enc, kernels: kernels, fp16: settings.fp16, performance: settings.performance, dummy: dummy)
+        guard let enc = commandBuffer.makeComputeCommandEncoder(dispatchType: .concurrent) else { throw LSFGError.metal("compute encoder") }
+        encodeAll(Sink(shared: enc, queue: nil), generate: generate)
+        enc.endEncoding()
+    }
+
+    /// Profiling: commits every dispatch as its own command buffer on `queue` and returns them
+    /// with their pass names, so each pass's GPU time can be read after completion.
+    public mutating func encodeProfiled(on queue: MTLCommandQueue, generate: Bool = true) -> [(name: String, commandBuffer: MTLCommandBuffer)] {
+        let sink = Sink(shared: nil, queue: queue)
+        encodeAll(sink, generate: generate)
+        return sink.profiled
+    }
+
+    private mutating func encodeAll(_ sink: Sink, generate: Bool) {
+        let e = Encoder(sink: sink, kernels: kernels, fp16: settings.fp16, performance: settings.performance, dummy: dummy)
         let fc = Int(frameIndex % 6) // 6 covers both the %2 and %3 rotations
+
+        // Dispatches run concurrently between barriers: independent passes (the 7 pyramid levels in
+        // alpha, the gamma and delta chains at a level) overlap instead of draining the GPU after each
+        // of ~100 mostly tiny dispatches. Each barrier marks a real data dependency.
 
         // 1. Pyramid and per-level features for the new frame.
         e.dispatch("mipmaps", constants: constants(timestamp: 0), samplers: [samplerBlack],
                    inputs: [inputs[fc % 2]], outputs: mips, groups: Self.groups(mips[0], 6))
-        for level in (0..<7).reversed() {
-            let a = alpha[level]
-            e.dispatch("alpha0", samplers: [samplerBlack], inputs: [mips[level]],
-                       outputs: a.temp1, groups: Self.groups(a.temp1[0], 3))
-            e.dispatch("alpha1", samplers: [samplerBlack], inputs: a.temp1, outputs: a.temp2, groups: Self.groups(a.temp1[0], 3))
-            e.dispatch("alpha2", samplers: [samplerBlack], inputs: a.temp2, outputs: a.temp3, groups: Self.groups(a.temp3[0], 3))
-            e.dispatch("alpha3", samplers: [samplerBlack], inputs: a.temp3, outputs: a.out[fc % 3], groups: Self.groups(a.temp3[0], 3))
+        e.barrier()
+        for step in 0..<4 {
+            for level in 0..<7 {
+                let a = alpha[level]
+                switch step {
+                case 0: e.dispatch("alpha0", samplers: [samplerBlack], inputs: [mips[level]],
+                                   outputs: a.temp1, groups: Self.groups(a.temp1[0], 3))
+                case 1: e.dispatch("alpha1", samplers: [samplerBlack], inputs: a.temp1, outputs: a.temp2,
+                                   groups: Self.groups(a.temp1[0], 3))
+                case 2: e.dispatch("alpha2", samplers: [samplerBlack], inputs: a.temp2, outputs: a.temp3,
+                                   groups: Self.groups(a.temp3[0], 3))
+                default: e.dispatch("alpha3", samplers: [samplerBlack], inputs: a.temp3, outputs: a.out[fc % 3],
+                                    groups: Self.groups(a.temp3[0], 3))
+                }
+            }
+            e.barrier()
         }
         let a0 = alpha[0].out
         let i3 = fc % 3
         e.dispatch("beta0", samplers: [samplerWhite], inputs: a0[(i3 + 1) % 3] + a0[(i3 + 2) % 3] + a0[i3],
                    outputs: beta.temp1, groups: Self.groups(beta.temp1[0], 3))
+        e.barrier()
         e.dispatch("beta1", samplers: [samplerBlack], inputs: beta.temp1, outputs: beta.temp2, groups: Self.groups(beta.temp1[0], 3))
+        e.barrier()
         e.dispatch("beta2", samplers: [samplerBlack], inputs: beta.temp2, outputs: beta.temp1, groups: Self.groups(beta.temp1[0], 3))
+        e.barrier()
         e.dispatch("beta3", samplers: [samplerBlack], inputs: beta.temp1, outputs: beta.temp2, groups: Self.groups(beta.temp1[0], 3))
+        e.barrier()
         e.dispatch("beta4", constants: constants(timestamp: 0.5), samplers: [samplerBlack], inputs: beta.temp2,
                    outputs: beta.out, groups: Self.groups(beta.temp1[0], 5))
+        e.barrier()
 
-        // 2. One generation pass per in-between frame, coarse to fine.
+        // 2. One generation pass per in-between frame, coarse to fine. At levels 4-6 the gamma and
+        // delta chains don't depend on each other, so their steps run side by side.
         if generate {
             let n = settings.generationCount
             for pass in 0..<n {
                 let t = Float(pass + 1) / Float(n + 1)
                 for i in 0..<7 {
-                    encodeGamma(e, i, fc: fc, timestamp: t)
-                    if i >= 4 { encodeDelta(e, i, fc: fc, timestamp: t) }
+                    for step in 0..<(i >= 4 ? 10 : 5) {
+                        if step < 5 { gammaStep(e, i, step, fc: fc, timestamp: t) }
+                        if i >= 4 { deltaStep(e, i, step, fc: fc, timestamp: t) }
+                        e.barrier()
+                    }
                 }
                 let ordered = fc % 2 == 0 ? [inputs[1], inputs[0]] : [inputs[0], inputs[1]]
                 e.dispatch("generate", constants: constants(timestamp: t), samplers: [samplerBlack, samplerEdge],
                            inputs: opt(ordered + [gamma[6].out, delta[2].out1, delta[2].out2]),
                            outputs: [outputs[pass]], groups: Self.groups(inputs[0], 4))
+                e.barrier()
             }
         }
-        enc.endEncoding()
         frameIndex += 1
     }
 
-    private func encodeGamma(_ e: Encoder, _ i: Int, fc: Int, timestamp: Float) {
+    /// Gamma chain at level `i` (coarse 0 to fine 6), step 0-4.
+    private func gammaStep(_ e: Encoder, _ i: Int, _ step: Int, fc: Int, timestamp: Float) {
         let g = gamma[i], aOut = alpha[6 - i].out
         let prev: MTLTexture? = i == 0 ? nil : gamma[i - 1].out
         let c = constants(timestamp: timestamp, firstIter: prev == nil)
         let grid = Self.groups(g.temp1[0], 3)
-        e.dispatch("gamma0", constants: c, samplers: [samplerWhite, samplerEdge],
-                   inputs: opt(aOut[(fc + 2) % 3] + aOut[fc % 3]) + [prev], outputs: Array(g.temp1[0..<3]), groups: grid)
-        e.dispatch("gamma1", samplers: [samplerBlack], inputs: Array(g.temp1[0..<3]), outputs: g.temp2, groups: grid)
         let w = g.temp2.count
-        e.dispatch("gamma2", samplers: [samplerBlack], inputs: g.temp2, outputs: Array(g.temp1[0..<w]), groups: grid)
-        e.dispatch("gamma3", samplers: [samplerBlack], inputs: Array(g.temp1[0..<w]), outputs: g.temp2, groups: grid)
-        e.dispatch("gamma4", constants: c, samplers: [samplerBlack, samplerEdge],
-                   inputs: opt(g.temp2) + [prev, beta.out[min(6 - i, 5)]], outputs: [g.out], groups: grid)
+        switch step {
+        case 0: e.dispatch("gamma0", constants: c, samplers: [samplerWhite, samplerEdge],
+                           inputs: opt(aOut[(fc + 2) % 3] + aOut[fc % 3]) + [prev], outputs: Array(g.temp1[0..<3]), groups: grid)
+        case 1: e.dispatch("gamma1", samplers: [samplerBlack], inputs: Array(g.temp1[0..<3]), outputs: g.temp2, groups: grid)
+        case 2: e.dispatch("gamma2", samplers: [samplerBlack], inputs: g.temp2, outputs: Array(g.temp1[0..<w]), groups: grid)
+        case 3: e.dispatch("gamma3", samplers: [samplerBlack], inputs: Array(g.temp1[0..<w]), outputs: g.temp2, groups: grid)
+        default: e.dispatch("gamma4", constants: c, samplers: [samplerBlack, samplerEdge],
+                            inputs: opt(g.temp2) + [prev, beta.out[min(6 - i, 5)]], outputs: [g.out], groups: grid)
+        }
     }
 
-    private func encodeDelta(_ e: Encoder, _ i: Int, fc: Int, timestamp: Float) {
+    /// Delta chain at level `i` (4-6), step 0-9.
+    private func deltaStep(_ e: Encoder, _ i: Int, _ step: Int, fc: Int, timestamp: Float) {
         let k = i - 4
         let d = delta[k], aOut = alpha[6 - i].out
         let opt1: MTLTexture? = k == 0 ? nil : gamma[i - 1].out
@@ -279,20 +347,22 @@ public struct LSFG31 {
         let c = constants(timestamp: timestamp, firstIterS: opt1 == nil)
         let grid = Self.groups(d.temp1[0], 3)
         let history = opt(aOut[(fc + 2) % 3] + aOut[fc % 3])
-        e.dispatch("delta0", constants: c, samplers: [samplerWhite, samplerEdge],
-                   inputs: history + [opt1], outputs: Array(d.temp1[0..<3]), groups: grid)
-        e.dispatch("delta1", samplers: [samplerBlack], inputs: Array(d.temp1[0..<3]), outputs: d.temp2, groups: grid)
         let w = d.temp2.count, h = w / 2
-        e.dispatch("delta2", samplers: [samplerBlack], inputs: d.temp2, outputs: Array(d.temp1[0..<w]), groups: grid)
-        e.dispatch("delta3", samplers: [samplerBlack], inputs: Array(d.temp1[0..<w]), outputs: d.temp2, groups: grid)
-        e.dispatch("delta4", constants: c, samplers: [samplerBlack, samplerEdge],
-                   inputs: opt(d.temp2) + [opt1, beta.out[6 - i]], outputs: [d.out1], groups: grid)
-        e.dispatch("delta5", constants: c, samplers: [samplerWhite, samplerEdge],
-                   inputs: history + [opt1, opt2], outputs: Array(d.temp2[0..<h]), groups: grid)
-        e.dispatch("delta6", samplers: [samplerBlack], inputs: Array(d.temp2[0..<h]), outputs: Array(d.temp1[0..<h]), groups: grid)
-        e.dispatch("delta7", samplers: [samplerBlack], inputs: Array(d.temp1[0..<h]), outputs: Array(d.temp2[0..<h]), groups: grid)
-        e.dispatch("delta8", samplers: [samplerBlack], inputs: Array(d.temp2[0..<h]), outputs: Array(d.temp1[0..<h]), groups: grid)
-        e.dispatch("delta9", constants: c, samplers: [samplerBlack, samplerEdge],
-                   inputs: opt(Array(d.temp1[0..<h])) + [opt3], outputs: [d.out2], groups: grid)
+        switch step {
+        case 0: e.dispatch("delta0", constants: c, samplers: [samplerWhite, samplerEdge],
+                           inputs: history + [opt1], outputs: Array(d.temp1[0..<3]), groups: grid)
+        case 1: e.dispatch("delta1", samplers: [samplerBlack], inputs: Array(d.temp1[0..<3]), outputs: d.temp2, groups: grid)
+        case 2: e.dispatch("delta2", samplers: [samplerBlack], inputs: d.temp2, outputs: Array(d.temp1[0..<w]), groups: grid)
+        case 3: e.dispatch("delta3", samplers: [samplerBlack], inputs: Array(d.temp1[0..<w]), outputs: d.temp2, groups: grid)
+        case 4: e.dispatch("delta4", constants: c, samplers: [samplerBlack, samplerEdge],
+                           inputs: opt(d.temp2) + [opt1, beta.out[6 - i]], outputs: [d.out1], groups: grid)
+        case 5: e.dispatch("delta5", constants: c, samplers: [samplerWhite, samplerEdge],
+                           inputs: history + [opt1, opt2], outputs: Array(d.temp2[0..<h]), groups: grid)
+        case 6: e.dispatch("delta6", samplers: [samplerBlack], inputs: Array(d.temp2[0..<h]), outputs: Array(d.temp1[0..<h]), groups: grid)
+        case 7: e.dispatch("delta7", samplers: [samplerBlack], inputs: Array(d.temp1[0..<h]), outputs: Array(d.temp2[0..<h]), groups: grid)
+        case 8: e.dispatch("delta8", samplers: [samplerBlack], inputs: Array(d.temp2[0..<h]), outputs: Array(d.temp1[0..<h]), groups: grid)
+        default: e.dispatch("delta9", constants: c, samplers: [samplerBlack, samplerEdge],
+                            inputs: opt(Array(d.temp1[0..<h])) + [opt3], outputs: [d.out2], groups: grid)
+        }
     }
 }

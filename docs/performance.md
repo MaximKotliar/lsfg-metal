@@ -81,3 +81,38 @@ The network itself is feasible on Apple Silicon: on an M4 Max it costs 0.4–4.5
 4. **Real game frames:** check quality, especially around HUD and UI elements.
 
 Not measured: power draw (needs `sudo powermetrics`), thermals in long sessions, and contention with a real game running at the same time.
+
+## Kernel optimization (2026-10-31)
+
+`lsfg-metal profile PREV NEXT [--size WxH] [--performance]` times every pass separately. The profile is flat: no single pass is more than about 12% of the frame. The cost is spread over about 100 dispatches per real frame, many of them tiny (pyramid levels 4–6 are a few dozen pixels wide).
+
+**What helped: running independent passes concurrently.** The graph used a serial compute encoder, so the GPU drained after each of the ~100 dispatches. It now uses a concurrent encoder with explicit barriers only where data flows:
+
+- The 4 alpha steps run all 7 pyramid levels at once (4 barriers instead of 28 serial dispatches).
+- At the finest levels (4–6), the gamma and delta chains run side by side.
+
+Output is bit-identical to before (checked for both modes, 2× and 3×). Sustained GPU time per real frame on an M4 Max:
+
+| Output | Mode | Flow | Mult | Before (ms) | After (ms) | Change |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1920x1080 | quality | 1.00 | 2× | 1.56 | 1.34 | -14% |
+| 1920x1080 | quality | 0.50 | 2× | 1.00 | 0.75 | -25% |
+| 1920x1080 | quality | 0.50 | 3× | 1.67 | 1.37 | -18% |
+| 1920x1080 | quality | 0.50 | 4× | 2.33 | 1.95 | -16% |
+| 1920x1080 | performance | 1.00 | 2× | 0.74 | 0.65 | -12% |
+| 1920x1080 | performance | 0.50 | 2× | 0.52 | 0.43 | -17% |
+| 1920x1080 | performance | 0.50 | 3× | 0.87 | 0.74 | -15% |
+| 1920x1080 | performance | 0.50 | 4× | 1.21 | 1.06 | -12% |
+| 2560x1440 | quality | 1.00 | 2× | 2.23 | 2.00 | -10% |
+| 2560x1440 | quality | 0.50 | 2× | 1.26 | 1.02 | -19% |
+| 2560x1440 | quality | 0.50 | 3× | 2.11 | 1.81 | -14% |
+| 2560x1440 | quality | 0.50 | 4× | 2.98 | 2.55 | -14% |
+| 2560x1440 | performance | 1.00 | 2× | 1.06 | 0.95 | -10% |
+| 2560x1440 | performance | 0.50 | 2× | 0.68 | 0.59 | -13% |
+| 2560x1440 | performance | 0.50 | 3× | 1.12 | 0.99 | -12% |
+| 2560x1440 | performance | 0.50 | 4× | 1.58 | 1.40 | -11% |
+
+**What didn't help:**
+
+- **Sampling textures as `half` instead of `float`** (48 kernels): no change. The compiler already handles the conversion.
+- **Hand-written `simdgroup_matrix` convolutions:** the translated 16→16-channel 3×3 layer (`gamma2`, quality mode) runs at about 6.2 trillion fp16 multiply-adds per second on the M4 Max, roughly 70% of the GPU's peak. A matrix-multiply rewrite of the same layer was 0.95× as fast, because the M4 has no separate matrix hardware. The convolutions are compute-bound, so the remaining big levers are doing less work (performance mode, lower flow scale), or matrix hardware on newer chips (Metal 4 tensor ops on M5-class GPUs).

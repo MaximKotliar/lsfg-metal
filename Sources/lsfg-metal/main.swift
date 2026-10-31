@@ -165,6 +165,31 @@ case "generate":
         fail("generate failed: \(error)")
     }
 
+case "profile":
+    // lsfg-metal profile PREV NEXT [--size WxH] [--performance] [--flow-scale F] [--frames N]
+    guard args.count >= 3 else { fail("usage: lsfg-metal profile PREV NEXT [--size WxH] [--performance] [--flow-scale F] [--frames N]") }
+    func value(_ flag: String) -> String? { args.firstIndex(of: flag).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
+    do {
+        var s = LSFGSettings()
+        s.performance = args.contains("--performance")
+        s.flowScale = value("--flow-scale").flatMap(Float.init) ?? 1.0
+        let size = (value("--size") ?? "2560x1440").split(separator: "x").compactMap { Int($0) }
+        let a = FrameIO.resized(try FrameIO.load(URL(fileURLWithPath: args[1])), width: size[0], height: size[1])
+        let b = FrameIO.resized(try FrameIO.load(URL(fileURLWithPath: args[2])), width: size[0], height: size[1])
+        let kernels = try LSFGKernels(cacheDirectory: try LSFGKernels.cacheDirectory(forDLL: resolveDLL(args)),
+                                      ids: LSFG31Shaders.allIDs(fp16: true, performance: s.performance))
+        let rows = try runProfile(prev: a, next: b, settings: s, kernels: kernels, frames: value("--frames").flatMap(Int.init) ?? 60)
+        let total = rows.reduce(0) { $0 + $1.ms }
+        print(String(format: "%dx%d, %@, flow %.2f: %.3f ms per real frame across %d passes\n", size[0], size[1],
+                     s.performance ? "performance" : "quality", s.flowScale, total, rows.count))
+        print("pass        calls  ms/frame    share")
+        for r in rows {
+            print(String(format: "%-10@ %5.0f  %8.3f  %6.1f%%", r.name as NSString, r.calls, r.ms, r.ms / total * 100))
+        }
+    } catch {
+        fail("profile failed: \(error)")
+    }
+
 case "bench":
     // lsfg-metal bench PREV NEXT [--frames N] [--sizes 1280x720,1920x1080,...]
     guard args.count >= 3 else { fail("usage: lsfg-metal bench PREV NEXT [--frames N] [--sizes WxH,...]") }

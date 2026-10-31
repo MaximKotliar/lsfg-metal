@@ -58,3 +58,47 @@ func runBench(prev: FrameIO.Image, next: FrameIO.Image, settings: LSFGSettings, 
                        throughputFPS: Double(frames) / wall,
                        memoryMB: Double(lsfg.memoryFootprint) / 1_048_576, dispatches: lsfg.dispatchesPerFrame)
 }
+
+/// Per-pass GPU cost: each dispatch runs as its own command buffer, timed by the GPU.
+func runProfile(prev: FrameIO.Image, next: FrameIO.Image, settings: LSFGSettings, kernels: LSFGKernels,
+                frames: Int) throws -> [(name: String, calls: Double, ms: Double)] {
+    let device = kernels.device
+    var lsfg = try LSFG31(width: prev.width, height: prev.height, settings: settings, kernels: kernels)
+    guard let queue = device.makeCommandQueue() else { throw LSFGError.metal("queue") }
+    func source(_ img: FrameIO.Image) throws -> MTLTexture {
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: img.width, height: img.height, mipmapped: false)
+        d.storageMode = .shared
+        guard let t = device.makeTexture(descriptor: d) else { throw LSFGError.metal("texture") }
+        FrameIO.upload(img, to: t)
+        return t
+    }
+    let sources = [try source(prev), try source(next)]
+    func feed(_ i: Int) {
+        let cb = queue.makeCommandBuffer()!
+        let blit = cb.makeBlitCommandEncoder()!
+        blit.copy(from: sources[i % 2], to: lsfg.nextInput)
+        blit.endEncoding()
+        cb.commit()
+    }
+    // Warm up (clocks and history) the normal way.
+    for i in 0..<30 {
+        feed(i)
+        let cb = queue.makeCommandBuffer()!
+        try lsfg.encode(into: cb)
+        cb.commit()
+        if i == 29 { cb.waitUntilCompleted() }
+    }
+    var totals: [String: (calls: Int, seconds: Double)] = [:]
+    for i in 0..<frames {
+        feed(i)
+        let passes = lsfg.encodeProfiled(on: queue)
+        passes.last?.commandBuffer.waitUntilCompleted()
+        for p in passes {
+            p.commandBuffer.waitUntilCompleted()
+            let t = totals[p.name] ?? (0, 0)
+            totals[p.name] = (t.calls + 1, t.seconds + p.commandBuffer.gpuEndTime - p.commandBuffer.gpuStartTime)
+        }
+    }
+    return totals.map { ($0.key, Double($0.value.calls) / Double(frames), $0.value.seconds * 1000 / Double(frames)) }
+        .sorted { $0.ms > $1.ms }
+}
