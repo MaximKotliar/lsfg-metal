@@ -43,3 +43,12 @@ import Testing
     try Data("MZ".utf8).write(to: common.appending(path: "Lossless.dll"))
     #expect(LosslessLocator.findAll(roots: [root]).isEmpty)
 }
+
+@Test func readsImportsOfAWindowsExecutable() throws {
+    // The hook's own test program imports kernel32 only.
+    let exe = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appending(path: "../../hook/build/vertest.exe")
+    guard let data = try? Data(contentsOf: exe) else { return } // hook not built: nothing to check
+    let info = try PEFile.info(of: data)
+    #expect(info.is64Bit)
+    #expect(info.imports == ["kernel32.dll"])
+}

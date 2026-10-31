@@ -19,39 +19,79 @@ public struct PEResource: Sendable {
     public let data: Data
 }
 
-/// Minimal PE32/PE32+ reader: just enough to list resources.
+/// Minimal PE32/PE32+ reader: resources, imports and machine type.
 public enum PEFile {
     public static let rtRCData: UInt32 = 10
 
-    public static func resources(in file: Data) throws -> [PEResource] {
-        let r = ByteReader(file)
-        guard try r.u16(0) == 0x5A4D else { throw ParseError.badMagic("MZ") }
-        let pe = try r.int(0x3C)
-        guard try r.u32(pe) == 0x0000_4550 else { throw ParseError.badMagic("PE") }
+    /// What a Windows executable is built for and which DLLs it imports.
+    public struct Info: Sendable {
+        public let is64Bit: Bool
+        /// Imported DLL names, lowercased (e.g. "dinput8.dll").
+        public let imports: [String]
+    }
 
-        let sectionCount = Int(try r.u16(pe + 6))
-        let optionalSize = Int(try r.u16(pe + 20))
-        let optional = pe + 24
-        let isPE32Plus = try r.u16(optional) == 0x20B
-        let dataDirs = optional + (isPE32Plus ? 112 : 96)
-        let resourceRVA = try r.int(dataDirs + 8 * 2)
-        guard resourceRVA != 0 else { return [] }
-
+    /// Parsed headers shared by the readers below.
+    private struct Header {
         struct Section { let va: Int, virtualSize: Int, raw: Int, rawSize: Int }
-        let sectionTable = optional + optionalSize
-        let sections = try (0..<sectionCount).map { i -> Section in
-            let s = sectionTable + 40 * i
-            return Section(va: try r.int(s + 12), virtualSize: try r.int(s + 8),
-                           raw: try r.int(s + 20), rawSize: try r.int(s + 16))
+        let reader: ByteReader
+        let machine: UInt16
+        let dataDirs: Int
+        let sections: [Section]
+
+        init(_ file: Data) throws {
+            let r = ByteReader(file)
+            guard try r.u16(0) == 0x5A4D else { throw ParseError.badMagic("MZ") }
+            let pe = try r.int(0x3C)
+            guard try r.u32(pe) == 0x0000_4550 else { throw ParseError.badMagic("PE") }
+            let sectionCount = Int(try r.u16(pe + 6))
+            let optionalSize = Int(try r.u16(pe + 20))
+            let optional = pe + 24
+            let isPE32Plus = try r.u16(optional) == 0x20B
+            let sectionTable = optional + optionalSize
+            reader = r
+            machine = try r.u16(pe + 4)
+            dataDirs = optional + (isPE32Plus ? 112 : 96)
+            sections = try (0..<sectionCount).map { i in
+                let s = sectionTable + 40 * i
+                return Section(va: try r.int(s + 12), virtualSize: try r.int(s + 8),
+                               raw: try r.int(s + 20), rawSize: try r.int(s + 16))
+            }
         }
+
+        func directoryRVA(_ index: Int) throws -> Int { try reader.int(dataDirs + 8 * index) }
+
         func fileOffset(rva: Int) throws -> Int {
             guard let s = sections.first(where: { rva >= $0.va && rva < $0.va + max($0.virtualSize, $0.rawSize) }) else {
                 throw ParseError.malformed("RVA 0x\(String(rva, radix: 16)) not in any section")
             }
             return rva - s.va + s.raw
         }
+    }
 
-        let base = try fileOffset(rva: resourceRVA)
+    public static func info(of file: Data) throws -> Info {
+        let h = try Header(file)
+        let r = h.reader
+        var imports: [String] = []
+        let importRVA = try h.directoryRVA(1)
+        if importRVA != 0 {
+            var d = try h.fileOffset(rva: importRVA)
+            // IMAGE_IMPORT_DESCRIPTOR (20 bytes), terminated by an all-zero entry; Name is at +12.
+            while imports.count < 4096 {
+                let nameRVA = try r.int(d + 12)
+                if nameRVA == 0 { break }
+                imports.append(try r.cString(try h.fileOffset(rva: nameRVA)).lowercased())
+                d += 20
+            }
+        }
+        return Info(is64Bit: h.machine == 0x8664 || h.machine == 0xAA64, imports: imports)
+    }
+
+    public static func resources(in file: Data) throws -> [PEResource] {
+        let h = try Header(file)
+        let r = h.reader
+        let resourceRVA = try h.directoryRVA(2)
+        guard resourceRVA != 0 else { return [] }
+        let base = try h.fileOffset(rva: resourceRVA)
 
         func key(_ raw: UInt32) throws -> PEResource.Key {
             guard raw & 0x8000_0000 != 0 else { return .id(raw) }
@@ -77,7 +117,7 @@ public enum PEFile {
                     let rva = try r.int(entry)
                     let size = try r.int(entry + 4)
                     out.append(PEResource(type: type, name: name, language: lang,
-                                          data: try r.bytes(try fileOffset(rva: rva), size)))
+                                          data: try r.bytes(try h.fileOffset(rva: rva), size)))
                 }
             }
         }

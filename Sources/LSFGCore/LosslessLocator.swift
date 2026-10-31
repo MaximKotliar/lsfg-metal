@@ -43,7 +43,7 @@ public enum LosslessLocator {
     }
 
     /// `steamapps` folders for every Steam library listed in a bottle.
-    static func steamLibraries(in bottle: URL) -> [URL] {
+    public static func steamLibraries(in bottle: URL) -> [URL] {
         let defaults = ["Program Files (x86)/Steam", "Program Files/Steam"].map {
             bottle.appending(path: "drive_c/\($0)/steamapps")
         }
