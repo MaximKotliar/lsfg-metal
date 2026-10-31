@@ -12,6 +12,7 @@ struct EvalOptions {
     var maxWidth = 1920         // downscale wider sources
     var settings = LSFGSettings()
     var samples: URL?           // write example triplets here
+    var cutThreshold = 40.0     // mean abs diff (0-255) above which a pair counts as a scene cut
 }
 
 struct EvalFrame {
@@ -168,6 +169,8 @@ func evaluate(frames: [EvalFrame], options: EvalOptions, kernels: LSFGKernels) t
     guard let queue = kernels.device.makeCommandQueue() else { throw LSFGError.metal("queue") }
 
     var scores: [Score] = []
+    var skippedCuts = 0
+    defer { if skippedCuts > 0 { print("  skipped \(skippedCuts) frame pairs that span a scene cut") } }
     // Real stream: even frames. Odd frames are ground truth for the frame in between.
     for k in stride(from: 0, to: frames.count, by: 2) {
         FrameIO.upload(frames[k].image, to: lsfg.nextInput)
@@ -179,9 +182,12 @@ func evaluate(frames: [EvalFrame], options: EvalOptions, kernels: LSFGKernels) t
         guard k >= 4 else { continue } // let the 3-slot history fill with real frames first
 
         let prev = frames[k - 2].image, next = frames[k].image, truth = frames[k - 1].image
+        // A scene cut between the two real frames can't be interpolated by anything; skip it.
+        let motion = meanAbsDiff(prev, next)
+        if motion > options.cutThreshold { skippedCuts += 1; continue }
         let gen = FrameIO.download(lsfg.outputs[0])
         let mix = blend(prev, next)
-        scores.append(Score(index: k - 1, motion: meanAbsDiff(prev, next),
+        scores.append(Score(index: k - 1, motion: motion,
                             psnrGen: psnr(gen, truth), psnrBlend: psnr(mix, truth), psnrRepeat: psnr(prev, truth),
                             ssimGen: ssim(gen, truth), ssimBlend: ssim(mix, truth)))
 
