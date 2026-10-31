@@ -126,10 +126,11 @@ extension LSFGKernels {
 
         // Specializing compiles each kernel for this GPU; do them in parallel. Metal caches the
         // results, so later launches are quick.
+        let jobList = jobs // immutable copy for the parallel loop
         let built = Mutex<[UInt32: Kernel]>([:])
         let failure = Mutex<String?>(nil)
-        DispatchQueue.concurrentPerform(iterations: jobs.count) { i in
-            let job = jobs[i]
+        DispatchQueue.concurrentPerform(iterations: jobList.count) { i in
+            let job = jobList[i]
             let values = MTLFunctionConstantValues()
             for (k, c) in job.constants.enumerated() {
                 switch c.kind {
