@@ -50,6 +50,9 @@ translate() {
     if grep -q gl_WorkGroupSize "$out/msl/$n.metal" && ! grep -q 'gl_WorkGroupSize =' "$out/msl/$n.metal"; then
         sed -i '' "s/^using namespace metal;/using namespace metal;\nconstant uint3 gl_WorkGroupSize = uint3(${size// /u, }u);/" "$out/msl/$n.metal"
     fi
+    # SPIRV-Cross keeps DXBC's "precise" multiplies exact with fma(a, b, 0) helpers marked optnone, which turns each
+    # into a real function call on the GPU. The helpers stay exact without the marker; only inlining changes.
+    sed -i '' 's/\[\[clang::optnone\]\] //' "$out/msl/$n.metal"
     # Shift Vulkan binding ranges into Metal's argument tables.
     perl -pi -e 's/\[\[sampler\((\d+)\)\]\]/"[[sampler(".($1>=16?$1-16:$1).")]]"/ge; s/\[\[texture\((\d+)\)\]\]/"[[texture(".($1>=32?$1-32:$1).")]]"/ge' "$out/msl/$n.metal"
     xcrun -sdk macosx metal -std=metal3.0 -O3 -c "$out/msl/$n.metal" -o "$out/air/$n.air" >>"$out/log/$n.txt" 2>&1

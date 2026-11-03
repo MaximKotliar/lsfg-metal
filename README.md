@@ -8,6 +8,10 @@ Only for people who own [Lossless Scaling on Steam](https://store.steampowered.c
 weights are read at run time from the user's own `Lossless.dll`. This repository never contains the DLL, its shaders
 or anything derived from them.
 
+The DLL's other shaders, Lossless Scaling's spatial upscalers (LS1, FSR 1 and more), are DXBC rather than SPIR-V:
+`scripts/translate-shaders.sh` translates them too when `DXBC_COMPILER` points at `dxbc_compiler` from
+[dxbc-spirv](https://github.com/doitsujin/dxbc-spirv). [lss-metal](https://github.com/MaximKotliar/lss-metal) runs them.
+
 For the app that puts this into games running under CrossOver, see
 [Lightscale](https://github.com/MaximKotliar/lightscale). Its upscaling companion is
 [nss-metal](https://github.com/MaximKotliar/nss-metal), a Metal port of Arm's
