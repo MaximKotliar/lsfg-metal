@@ -14,13 +14,61 @@ public struct LosslessInstall: Sendable {
 }
 
 public enum LosslessLocator {
-    /// Bottle roots to scan. `LSFG_BOTTLES` (colon-separated) is checked first.
-    public static func bottleRoots(environment: [String: String] = ProcessInfo.processInfo.environment) -> [URL] {
+    /// Where CrossOver is usually installed.
+    public static var defaultCrossOverApps: [URL] {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        var roots = (environment["LSFG_BOTTLES"] ?? "").split(separator: ":").map { URL(fileURLWithPath: String($0)) }
+        return [home.appending(path: "Applications/CrossOver.app"), URL(fileURLWithPath: "/Applications/CrossOver.app")]
+    }
+
+    /// Bottle roots to scan, in order, without duplicates:
+    /// 1. `LSFG_BOTTLES` (colon-separated),
+    /// 2. the folders CrossOver itself uses: `CX_BOTTLE_PATH` from the environment or from an `[EnvironmentVariables]`
+    ///    section, else `[CrossOver] BottlePath`, in the user's CrossOver.conf or the app's own (where tools such as
+    ///    CXPatcher set `~/CXPBottles`),
+    /// 3. CrossOver's default `~/Library/Application Support/CrossOver/Bottles`, and `~/CXPBottles`.
+    public static func bottleRoots(environment: [String: String] = ProcessInfo.processInfo.environment,
+                                   crossOverApps: [URL] = defaultCrossOverApps,
+                                   home: URL = FileManager.default.homeDirectoryForCurrentUser) -> [URL] {
+        var roots = paths(environment["LSFG_BOTTLES"] ?? "", home: home)
+        roots += paths(environment["CX_BOTTLE_PATH"] ?? "", home: home)
+        let confs = [home.appending(path: "Library/Application Support/CrossOver/CrossOver.conf")]
+            + crossOverApps.map { $0.appending(path: "Contents/SharedSupport/CrossOver/etc/CrossOver.conf") }
+        for conf in confs {
+            guard let text = try? String(contentsOf: conf, encoding: .utf8) else { continue }
+            let values = confValues(text)
+            roots += paths(values["EnvironmentVariables"]?["CX_BOTTLE_PATH"] ?? "", home: home)
+            roots += paths(values["CrossOver"]?["BottlePath"] ?? "", home: home)
+        }
         roots.append(home.appending(path: "Library/Application Support/CrossOver/Bottles"))
         roots.append(home.appending(path: "CXPBottles"))
-        return roots
+        var seen = Set<String>()
+        return roots.filter { seen.insert($0.standardizedFileURL.path).inserted }
+    }
+
+    /// `"Key" = "Value"` entries of a CrossOver .conf file, by section (`;` lines are comments).
+    static func confValues(_ text: String) -> [String: [String: String]] {
+        var result: [String: [String: String]] = [:]
+        var section = ""
+        for raw in text.split(whereSeparator: \.isNewline) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix(";") { continue }
+            if line.hasPrefix("["), line.hasSuffix("]") { section = String(line.dropFirst().dropLast()); continue }
+            let parts = line.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard parts.count == 2 else { continue }
+            let unquote = { (s: String) in s.count >= 2 && s.hasPrefix("\"") && s.hasSuffix("\"") ? String(s.dropFirst().dropLast()) : s }
+            result[section, default: [:]][unquote(parts[0])] = unquote(parts[1])
+        }
+        return result
+    }
+
+    /// Colon-separated folders, with `~`, `${HOME}` and `${USER}` expanded.
+    static func paths(_ list: String, home: URL) -> [URL] {
+        list.split(separator: ":").map { item in
+            var p = String(item).replacingOccurrences(of: "${HOME}", with: home.path)
+                .replacingOccurrences(of: "${USER}", with: NSUserName())
+            if p == "~" || p.hasPrefix("~/") { p = home.path + p.dropFirst() }
+            return URL(fileURLWithPath: p)
+        }
     }
 
     /// Every Lossless Scaling Steam install found across all bottles.

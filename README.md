@@ -10,7 +10,8 @@ or anything derived from them.
 
 For the app that puts this into games running under CrossOver, see
 [Lightscale](https://github.com/MaximKotliar/lightscale). Its upscaling companion is
-[nss-metal](https://github.com/MaximKotliar/nss-metal).
+[nss-metal](https://github.com/MaximKotliar/nss-metal), a Metal port of Arm's
+[Neural Super Sampling](https://huggingface.co/Arm/neural-super-sampling).
 
 ## What's here
 
@@ -73,7 +74,7 @@ Translated output is cached in `~/Library/Caches/lsfg-metal/<dll hash>/`.
 
 ## Commands
 
-- `locate`: finds Lossless Scaling installs in `~/Library/Application Support/CrossOver/Bottles`, `~/CXPBottles` and any `LSFG_BOTTLES` folders.
+- `locate`: finds Lossless Scaling installs in every bottle folder CrossOver uses: its default `~/Library/Application Support/CrossOver/Bottles`, a custom folder set in CrossOver's settings (`BottlePath`) or by `CX_BOTTLE_PATH` (as CXPatcher builds do, `~/CXPBottles`), plus any `LSFG_BOTTLES` folders.
 - `inspect [--verbose]`: lists the shaders with thread-group size, instruction count and named bindings.
 - `dump --out DIR`: writes the shaders as `.dxbc` files. Keep `DIR` outside the repo.
 - `check`: builds a Metal pipeline for every translated kernel.
