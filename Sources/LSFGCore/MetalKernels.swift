@@ -69,11 +69,28 @@ public struct BakedManifest: Codable, Sendable {
         public var hash: String
         public var constants: Int
         public var group: [Int]
+        /// DXBC kernels: where each function constant comes from (SPIR-V kernels take theirs in order).
+        public var slots: [Slot]?
 
-        public init(hash: String, constants: Int, group: [Int]) {
+        public init(hash: String, constants: Int, group: [Int], slots: [Slot]? = nil) {
             self.hash = hash
             self.constants = constants
             self.group = group
+            self.slots = slots
+        }
+    }
+
+    /// One function constant of a DXBC kernel: the shader's float immediate number `i` (from the user's DLL), or a
+    /// value the translation added itself (`fixed`, raw bits). `half`: an fp16 constant (the immediate is fp32).
+    public struct Slot: Codable, Sendable, Equatable {
+        public var i: Int?
+        public var fixed: UInt32?
+        public var half: Bool
+
+        public init(i: Int? = nil, fixed: UInt32? = nil, half: Bool) {
+            self.i = i
+            self.fixed = fixed
+            self.half = half
         }
     }
 
@@ -86,6 +103,9 @@ public struct BakedManifest: Codable, Sendable {
 extension LSFGKernels {
     public static let skeletonLibraryName = "lsfg-skeleton.metallib"
     public static let manifestName = "manifest.json"
+    /// Lossless Scaling's DXBC upscalers, baked the same way (lss-metal loads them).
+    public static let dxbcSkeletonLibraryName = "dxbc-skeleton.metallib"
+    public static let dxbcManifestName = "dxbc-manifest.json"
 
     public static func loadManifest(_ bakedDirectory: URL) throws -> BakedManifest {
         try JSONDecoder().decode(BakedManifest.self, from: Data(contentsOf: bakedDirectory.appending(path: manifestName)))
@@ -99,6 +119,17 @@ extension LSFGKernels {
         return try ids.sorted().filter { id in
             guard let entry = manifest.kernels[String(id)], let code = spirv[id] else { return true }
             return try SPIRVConstants.lift(code).structureHash != entry.hash
+        }
+    }
+
+    /// The baked DXBC kernels (Lossless Scaling's upscalers) whose structure in the user's DLL differs from the
+    /// baked ones. Empty means they all fit.
+    public static func dxbcBakedMismatches(bakedDirectory: URL, dll: URL) throws -> [UInt32] {
+        let manifest = try JSONDecoder().decode(BakedManifest.self, from: Data(contentsOf: bakedDirectory.appending(path: dxbcManifestName)))
+        let shaders = Dictionary(uniqueKeysWithValues: try LSFGShaderLibrary(dll: dll).entries.map { ($0.resourceID, $0.shader.bytes) })
+        return manifest.kernels.keys.compactMap(UInt32.init).sorted().filter { id in
+            guard let dxbc = shaders[id], let hash = try? DXBCConstants.structureHash(dxbc) else { return true }
+            return hash != manifest.kernels[String(id)]?.hash
         }
     }
 

@@ -173,8 +173,16 @@ case "bake":
         let out = URL(fileURLWithPath: args[o + 1])
         try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
         let start = Date()
-        let count = try bake(dll: resolveDLL(args), out: out)
+        let dll = resolveDLL(args)
+        let count = try bake(dll: dll, out: out)
         print(String(format: "baked %d kernels into %@ in %.1fs", count, out.path, Date().timeIntervalSince(start)))
+        // --dxbc-compiler PATH --dxbc-ids 133,134,...: also Lossless Scaling's DXBC upscalers (dxbc-spirv)
+        if let c = args.firstIndex(of: "--dxbc-compiler"), c + 1 < args.count,
+           let i = args.firstIndex(of: "--dxbc-ids"), i + 1 < args.count {
+            let ids = args[i + 1].split(separator: ",").compactMap { UInt32($0) }
+            let n = try bakeDXBC(dll: dll, out: out, ids: ids, dxbcCompiler: URL(fileURLWithPath: args[c + 1]))
+            print(String(format: "baked %d DXBC kernels in %.1fs", n, Date().timeIntervalSince(start)))
+        }
     } catch {
         fail("bake failed: \(error)")
     }
@@ -190,6 +198,15 @@ case "icon":
         print("wrote \(ico.count) bytes")
     } catch {
         fail("icon failed: \(error)")
+    }
+
+case "dxbc-imm":
+    // lsfg-metal dxbc-imm FILE.dxbc: the float immediates the DXBC bake lifts, as raw bits (dev tool)
+    guard args.count >= 2 else { fail("usage: lsfg-metal dxbc-imm FILE.dxbc") }
+    do {
+        print(try DXBCConstants.values(try Data(contentsOf: URL(fileURLWithPath: args[1]))).map(String.init).joined(separator: ","))
+    } catch {
+        fail("dxbc-imm failed: \(error)")
     }
 
 case "lift":

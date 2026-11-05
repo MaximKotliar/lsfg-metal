@@ -15,6 +15,22 @@ public enum SPIRVConstants {
         public enum Kind: Sendable { case half, float }
         public let kind: Kind
         public let bits: UInt32 // raw IEEE bits (low 16 for half)
+
+        public init(kind: Kind, bits: UInt32) {
+            self.kind = kind
+            self.bits = bits
+        }
+
+        public var value: Float { kind == .half ? Self.halfToFloat(UInt16(truncatingIfNeeded: bits)) : Float(bitPattern: bits) }
+
+        /// fp16 bits -> Float (Float16 is arm64-only; this also builds for x86_64).
+        static func halfToFloat(_ h: UInt16) -> Float {
+            let sign: Float = h & 0x8000 != 0 ? -1 : 1
+            let exp = Int((h >> 10) & 0x1F), frac = Float(h & 0x3FF)
+            if exp == 0 { return sign * frac * 0x1p-24 }
+            if exp == 31 { return frac == 0 ? sign * .infinity : .nan }
+            return sign * (1 + frac / 1024) * Float(sign: .plus, exponent: exp - 15, significand: 1)
+        }
     }
 
     public struct Lifted: Sendable {
@@ -32,11 +48,13 @@ public enum SPIRVConstants {
     }
 
     private static let opTypeFloat: UInt32 = 22, opConstant: UInt32 = 43, opConstantComposite: UInt32 = 44
-    private static let opSpecConstant: UInt32 = 50, opDecorate: UInt32 = 71
+    private static let opSpecConstant: UInt32 = 50, opSpecConstantComposite: UInt32 = 51, opDecorate: UInt32 = 71
     private static let opFunction: UInt32 = 54, opLabel: UInt32 = 248, opVariable: UInt32 = 59, opCompositeConstruct: UInt32 = 80
     private static let decorationSpecId: UInt32 = 1
 
-    public static func lift(_ spirv: Data) throws -> Lifted {
+    /// `moveComposites`: rebuild vectors of lifted constants inside the (single) entry function, as LSFG's shaders
+    /// need. Off (DXBC shaders, which have helper functions): they stay at program scope as spec constant composites.
+    public static func lift(_ spirv: Data, moveComposites: Bool = true) throws -> Lifted {
         let words: [UInt32] = spirv.withUnsafeBytes { Array($0.bindMemory(to: UInt32.self)) }
         guard words.count > 5, words[0] == 0x0723_0203 else { throw ParseError.badMagic("SPIR-V") }
         var header = Array(words[0..<5])
@@ -73,6 +91,11 @@ public enum SPIRVConstants {
                 instructions[n].words[0] = (UInt32(ins.words.count) << 16) | opSpecConstant
                 instructions[n].words[3] = 0
                 hashed[n].words[3] = 0
+            case opConstantComposite where ins.words[3...].contains(where: specResults.contains) && !moveComposites:
+                // Same layout as OpSpecConstantComposite.
+                specResults.insert(ins.words[2])
+                instructions[n].opcode = opSpecConstantComposite
+                instructions[n].words[0] = (UInt32(ins.words.count) << 16) | opSpecConstantComposite
             case opConstantComposite where ins.words[3...].contains(where: specResults.contains):
                 // Same layout as OpCompositeConstruct: [op, type, result, constituents...].
                 specResults.insert(ins.words[2])
@@ -87,7 +110,7 @@ public enum SPIRVConstants {
         }
 
         // Move the composites into the entry function: after its first label and local variables.
-        guard instructions.count(where: { $0.opcode == opFunction }) == 1 else {
+        guard !moveComposites || instructions.count(where: { $0.opcode == opFunction }) == 1 else {
             throw ParseError.malformed("expected one function in the shader")
         }
         instructions = instructions.enumerated().filter { !movedIndices.contains($0.offset) }.map(\.element)
