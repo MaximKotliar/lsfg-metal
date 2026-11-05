@@ -2,6 +2,10 @@ import Foundation
 import LSFGCore
 import Synchronization
 
+/// Baked libraries load on macOS 15 and later; without this the compiler targets the Mac that bakes them, and an
+/// older macOS refuses the library.
+let minimumOS = "-mmacosx-version-min=15.0"
+
 /// Builds the pre-baked kernel library: every LSFG 3.1 shader with its weights lifted out into
 /// zeroed function constants, translated (SPIRV-Cross) and compiled once. The output contains no
 /// weights; at runtime LSFGKernels(bakedDirectory:dll:ids:) fills them in from the user's DLL.
@@ -46,7 +50,7 @@ func bake(dll: URL, out: URL) throws -> Int {
             try run(spirvCross, [spv.path, "--msl", "--msl-version", "30000", "--msl-decoration-binding",
                                  "--rename-entry-point", "main", "lsfg_\(id)", "comp", "--output", msl.path])
             try SPIRVConstants.fixUpMSL(String(contentsOf: msl, encoding: .utf8)).write(to: msl, atomically: true, encoding: .utf8)
-            try run(xcrun, ["-sdk", "macosx", "metal", "-std=metal3.0", "-O3", "-c", msl.path,
+            try run(xcrun, ["-sdk", "macosx", "metal", "-std=metal3.0", "-O3", minimumOS, "-c", msl.path,
                             "-o", work.appending(path: "\(id).air").path])
             entries.withLock {
                 $0[String(id)] = BakedManifest.Entry(hash: lifted.structureHash, constants: lifted.constants.count,
@@ -136,7 +140,7 @@ func bakeDXBC(dll: URL, out: URL, ids: [UInt32], dxbcCompiler: URL) throws -> In
                     with: "using namespace metal;\nconstant uint3 gl_WorkGroupSize = uint3(\(size.0)u, \(size.1)u, \(size.2)u);")
             }
             try source.write(to: msl, atomically: true, encoding: .utf8)
-            try run(xcrun, ["-sdk", "macosx", "metal", "-std=metal3.0", "-O3", "-c", msl.path,
+            try run(xcrun, ["-sdk", "macosx", "metal", "-std=metal3.0", "-O3", minimumOS, "-c", msl.path,
                             "-o", work.appending(path: "\(id).air").path])
             let hash = try DXBCConstants.structureHash(dxbc)
             entries.withLock {

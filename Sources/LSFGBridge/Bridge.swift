@@ -66,11 +66,11 @@ public func lsfg_bridge_create(_ device: UnsafeRawPointer, _ width: Int32, _ hei
         let ids = LSFG31Shaders.allIDs(fp16: settings.fp16, performance: settings.performance)
         let baked = ownDirectory().appending(path: "baked")
         let kernels: LSFGKernels
-        if FileManager.default.fileExists(atPath: baked.appending(path: LSFGKernels.manifestName).path),
-           let prebuilt = try? LSFGKernels(bakedDirectory: baked, dll: dll, ids: ids, device: device) {
-            kernels = prebuilt
+        if FileManager.default.fileExists(atPath: baked.appending(path: LSFGKernels.manifestName).path) {
+            do { kernels = try LSFGKernels(bakedDirectory: baked, dll: dll, ids: ids, device: device) }
+            catch { kernels = try fallbackKernels(dll: dll, ids: ids, device: device, bakedError: error) }
         } else {
-            kernels = try LSFGKernels(cacheDirectory: try LSFGKernels.cacheDirectory(forDLL: dll), ids: ids, device: device)
+            kernels = try fallbackKernels(dll: dll, ids: ids, device: device, bakedError: nil)
         }
         let lsfg = try LSFG31(width: Int(width), height: Int(height), format: format, settings: settings, kernels: kernels)
         return Unmanaged.passRetained(Context(lsfg: lsfg)).toOpaque()
@@ -114,4 +114,14 @@ public func lsfg_bridge_output(_ ctx: UnsafeMutableRawPointer, _ index: Int32) -
 @_cdecl("lsfg_bridge_destroy")
 public func lsfg_bridge_destroy(_ ctx: UnsafeMutableRawPointer) {
     Unmanaged<Context>.fromOpaque(ctx).release()
+}
+
+/// Kernels translated on this Mac (needs the translation tools), for when the pre-baked ones are missing or don't
+/// load. If that fails too, the error says why the pre-baked ones didn't: that's the one worth reading.
+private func fallbackKernels(dll: URL, ids: Set<UInt32>, device: MTLDevice, bakedError: Error?) throws -> LSFGKernels {
+    do { return try LSFGKernels(cacheDirectory: try LSFGKernels.cacheDirectory(forDLL: dll), ids: ids, device: device) }
+    catch {
+        guard let bakedError else { throw error }
+        throw LSFGError.metal("pre-baked kernels didn't load (\(bakedError)); translating them here failed too (\(error))")
+    }
 }
