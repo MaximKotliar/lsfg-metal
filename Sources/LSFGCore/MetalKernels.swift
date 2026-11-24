@@ -7,6 +7,11 @@ public struct LSFGKernels: @unchecked Sendable {
     public struct Kernel: @unchecked Sendable {
         public let pipeline: MTLComputePipelineState
         public let threadgroupSize: MTLSize
+
+        public init(pipeline: MTLComputePipelineState, threadgroupSize: MTLSize) {
+            self.pipeline = pipeline
+            self.threadgroupSize = threadgroupSize
+        }
     }
 
     public let device: MTLDevice
@@ -52,7 +57,10 @@ public struct LSFGKernels: @unchecked Sendable {
         self.kernels = kernels
     }
 
-    private init(device: MTLDevice, kernels: [UInt32: Kernel]) {
+    /// Pipelines the host built itself, keyed by resource ID: for example from MSL that an app translates
+    /// in-process with SPIRV-Cross, so its users need neither the translate script nor a baked library.
+    /// They must follow the binding layout described in scripts/translate-shaders.sh.
+    public init(device: MTLDevice, kernels: [UInt32: Kernel]) {
         self.device = device
         self.kernels = kernels
     }
