@@ -5,13 +5,13 @@ import Synchronization
 
 /// Sustained benchmark: feeds frames back to back (alternating two images, copied on the GPU
 /// the way a presentation hook would), keeps several frames in flight, and measures
-/// per-frame GPU time, CPU encode time and throughput.
+/// per-frame GPU time, CPU encode time (wall time of the LSFG encode call) and throughput.
 struct BenchResult {
     let gpuMedian: Double, gpuP95: Double, cpuEncode: Double, throughputFPS: Double, memoryMB: Double, dispatches: Int
 }
 
 func runBench(prev: FrameIO.Image, next: FrameIO.Image, settings: LSFGSettings, kernels: LSFGKernels,
-              frames: Int, inFlight: Int = 3) throws -> BenchResult {
+              frames: Int, inFlight: Int = 3, planned: Bool = true) throws -> BenchResult {
     let device = kernels.device
     var lsfg = try LSFG31(width: prev.width, height: prev.height, settings: settings, kernels: kernels)
     guard let queue = device.makeCommandQueue() else { throw LSFGError.metal("queue") }
@@ -35,18 +35,20 @@ func runBench(prev: FrameIO.Image, next: FrameIO.Image, settings: LSFGSettings, 
     for i in 0..<(warmup + frames) {
         if i == warmup { queue.makeCommandBuffer().map { $0.commit(); $0.waitUntilCompleted() }; start = Date() }
         slots.wait()
-        let t0 = DispatchTime.now().uptimeNanoseconds
         guard let cb = queue.makeCommandBuffer(), let blit = cb.makeBlitCommandEncoder() else { throw LSFGError.metal("cb") }
         blit.copy(from: sources[i % 2], to: lsfg.nextInput)
         blit.endEncoding()
-        try lsfg.encode(into: cb, generate: true)
+        // Wall time of the LSFG encode alone (thread CPU time reads near zero under Rosetta).
+        let t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        if planned { try lsfg.encode(into: cb, generate: true) } else { try lsfg.encodeUnplanned(into: cb, generate: true) }
+        let t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         let measured = i >= warmup
         cb.addCompletedHandler { cb in
             if measured { gpuTimes.withLock { $0.append((cb.gpuEndTime - cb.gpuStartTime) * 1000) } }
             slots.signal()
         }
         cb.commit()
-        if measured { cpuTimes.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6) }
+        if measured { cpuTimes.append(Double(t1 - t0) / 1e6) }
     }
     for _ in 0..<inFlight { slots.wait() } // drain: every frame has completed
     let wall = Date().timeIntervalSince(start)
@@ -101,4 +103,24 @@ func runProfile(prev: FrameIO.Image, next: FrameIO.Image, settings: LSFGSettings
     }
     return totals.map { ($0.key, Double($0.value.calls) / Double(frames), $0.value.seconds * 1000 / Double(frames)) }
         .sorted { $0.ms > $1.ms }
+}
+
+/// CPU cost of encoding alone: encodes `frames` real frames back to back into command buffers that
+/// are never committed, so no GPU work or waiting mixes in. Returns (median, p10, p90) in ms.
+func runEncodeBench(width: Int, height: Int, settings: LSFGSettings, kernels: LSFGKernels,
+                    frames: Int, planned: Bool) throws -> (Double, Double, Double) {
+    var lsfg = try LSFG31(width: width, height: height, settings: settings, kernels: kernels)
+    guard let queue = kernels.device.makeCommandQueue() else { throw LSFGError.metal("queue") }
+    var times: [Double] = []
+    for i in 0..<(frames + 50) {
+        try autoreleasepool {
+            guard let cb = queue.makeCommandBuffer() else { throw LSFGError.metal("cb") }
+            let t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            if planned { try lsfg.encode(into: cb, generate: true) } else { try lsfg.encodeUnplanned(into: cb, generate: true) }
+            let t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            if i >= 50 { times.append(Double(t1 - t0) / 1e6) }
+        }
+    }
+    times.sort()
+    return (times[times.count / 2], times[times.count / 10], times[times.count * 9 / 10])
 }

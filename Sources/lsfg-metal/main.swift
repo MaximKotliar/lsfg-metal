@@ -14,8 +14,9 @@ commands:
                       write the frame(s) between two images using LSFG 3.1 on Metal
   eval VIDEO|DIR [--start S] [--count N] [--max-width W] [--flow-scale F] [--performance] [--samples DIR]
                       score generated frames against a real recording (every other frame is held out)
-  bench PREV NEXT [--frames N] [--sizes WxH,...]
+  bench PREV NEXT [--frames N] [--sizes WxH,...] [--unplanned] [--encode-only]
                       sustained benchmark across sizes, modes, flow scales and multipliers
+  plancheck PREV NEXT check that replayed dispatch plans give the same frames as direct encoding
 
 environment:
   LSFG_BOTTLES  extra bottle folders to scan, colon-separated
@@ -259,6 +260,20 @@ case "bench":
         let ids = LSFG31Shaders.allIDs(fp16: true, performance: false).union(LSFG31Shaders.allIDs(fp16: true, performance: true))
         let kernels = try value("--baked").map { try LSFGKernels(bakedDirectory: URL(fileURLWithPath: $0), dll: resolveDLL(args), ids: ids) }
             ?? LSFGKernels(cacheDirectory: dir, ids: ids)
+        if args.contains("--encode-only") {
+            print("CPU encode only (ms per real frame, median / p10 / p90), \(frames) frames, never committed\n")
+            print("size       mode  flow  mult  planned               unplanned")
+            for (w, h) in sizes { for perf in [false, true] { for flow in [Float(1.0), 0.5] { for mult in [2, 3, 4] {
+                if mult > 2 && flow != 0.5 { continue }
+                var s = LSFGSettings()
+                s.performance = perf; s.flowScale = flow; s.multiplier = mult
+                let p = try runEncodeBench(width: w, height: h, settings: s, kernels: kernels, frames: frames, planned: true)
+                let u = try runEncodeBench(width: w, height: h, settings: s, kernels: kernels, frames: frames, planned: false)
+                print(String(format: "%-10@ %-5@ %4.2f  %4d  %.3f / %.3f / %.3f   %.3f / %.3f / %.3f",
+                             "\(w)x\(h)" as NSString, (perf ? "perf" : "qual") as NSString, flow, mult, p.0, p.1, p.2, u.0, u.1, u.2))
+            } } } }
+            exit(0)
+        }
         print("device: \(kernels.device.name), \(frames) frames per row, 3 in flight, fp16\n")
         print("size       mode  flow  mult  GPU med  GPU p95  CPU enc  max fps  mem MB  dispatches")
         for (w, h) in sizes {
@@ -267,7 +282,8 @@ case "bench":
                 if mult > 2 && flow != 0.5 { continue }
                 var s = LSFGSettings()
                 s.performance = perf; s.flowScale = flow; s.multiplier = mult
-                let r = try runBench(prev: pa, next: pb, settings: s, kernels: kernels, frames: frames)
+                let r = try runBench(prev: pa, next: pb, settings: s, kernels: kernels, frames: frames,
+                                     planned: !args.contains("--unplanned"))
                 print(String(format: "%-10@ %-5@ %4.2f  %4d  %6.2f   %6.2f   %6.3f   %7.0f  %6.0f  %d",
                              "\(w)x\(h)" as NSString, (perf ? "perf" : "qual") as NSString, flow, mult,
                              r.gpuMedian, r.gpuP95, r.cpuEncode, r.throughputFPS, r.memoryMB, r.dispatches))
@@ -275,6 +291,19 @@ case "bench":
         }
     } catch {
         fail("bench failed: \(error)")
+    }
+
+case "plancheck":
+    // lsfg-metal plancheck PREV NEXT: the recorded-plan path must match direct encoding bit for bit.
+    guard args.count >= 3 else { fail("usage: lsfg-metal plancheck PREV NEXT") }
+    do {
+        let a = try FrameIO.load(URL(fileURLWithPath: args[1])), b = try FrameIO.load(URL(fileURLWithPath: args[2]))
+        let ids = LSFG31Shaders.allIDs(fp16: true, performance: false).union(LSFG31Shaders.allIDs(fp16: true, performance: true))
+        let kernels = try LSFGKernels(cacheDirectory: LSFGKernels.cacheDirectory(forDLL: resolveDLL(args)), ids: ids)
+        let failures = try runPlanCheck(prev: a, next: b, kernels: kernels)
+        if failures > 0 { fail("\(failures) configurations differ") }
+    } catch {
+        fail("plancheck failed: \(error)")
     }
 
 case "eval":

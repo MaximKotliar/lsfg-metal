@@ -47,6 +47,10 @@ Higher multipliers at flow 0.5 (each extra generated frame adds a gamma/delta/ge
 Other costs:
 
 - **CPU:** 0.08–0.31 ms per real frame to encode 100–232 dispatches. That matters because games under CrossOver are often CPU-bound (Rosetta plus Wine), and LSFG barely touches the CPU.
+  Since then, each frame replays a recorded list of dispatches (one per `frameIndex % 6` rotation) instead of
+  rebuilding every dispatch's arguments. `lsfg-metal bench --encode-only` (1440p, M4 Max, encode only, median):
+  native 0.04–0.10 ms (was 0.08–0.24), x86_64 under Rosetta (how the CrossOver hook runs it) 0.07–0.18 ms
+  (was 0.15–0.45). `lsfg-metal plancheck` confirms the replayed frames match direct encoding byte for byte.
 - **Memory:** 16–272 MB of textures (4K quality at flow 1.0 is the largest). Trivial on unified memory.
 - **Startup:** building the 26 pipelines one mode needs takes about 0.05 s with a warm Metal shader cache. The very first build of all 300 kernels took 18–28 s, so a shipped tool should precompile into an `MTLBinaryArchive`.
 

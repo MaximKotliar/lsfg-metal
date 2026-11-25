@@ -77,6 +77,23 @@ public struct LSFG31 {
     private struct Gamma { let temp1: [MTLTexture], temp2: [MTLTexture], out: MTLTexture }
     private struct Delta { let temp1: [MTLTexture], temp2: [MTLTexture], out1: MTLTexture, out2: MTLTexture }
 
+    /// One recorded dispatch with everything it binds, so a frame replays a flat list instead of
+    /// rebuilding ~100-230 dispatches' arguments. That bookkeeping was most of the CPU cost under
+    /// Rosetta, where the hook's x86_64 copy of this engine runs on the game's present thread.
+    private struct Step {
+        let pipeline: MTLComputePipelineState
+        let threads: MTLSize
+        let groups: MTLSize
+        let constants: [UInt32]             // empty: the dispatch takes none
+        let samplers: [MTLSamplerState?]
+        let textures: [MTLTexture?]         // inputs from 0, outputs from 16, nil in between
+        let barrierAfter: Bool
+    }
+
+    /// The pass graph depends only on `frameIndex % 6` (the %2 and %3 history rotations) and on
+    /// whether frames are generated, so 12 lists cover every frame. Built on first use.
+    private var plans: [[Step]?] = Array(repeating: nil, count: 12)
+
     /// GPU memory held by all of this context's textures, in bytes.
     public var memoryFootprint: Int {
         var all: [MTLTexture] = inputs + outputs + mips + [dummy]
@@ -179,15 +196,19 @@ public struct LSFG31 {
          0, 0, 0]
     }
 
-    /// Where dispatches go: one shared encoder, or (profiling) one command buffer per dispatch.
+    /// Where dispatches go: one shared encoder, (profiling) one command buffer per dispatch,
+    /// or (recording) a list of steps to replay.
     private final class Sink {
         let shared: MTLComputeCommandEncoder?
         let queue: MTLCommandQueue?
+        let recording: Bool
         var profiled: [(name: String, commandBuffer: MTLCommandBuffer)] = []
+        var steps: [Step] = []
 
-        init(shared: MTLComputeCommandEncoder?, queue: MTLCommandQueue?) {
+        init(shared: MTLComputeCommandEncoder?, queue: MTLCommandQueue?, recording: Bool = false) {
             self.shared = shared
             self.queue = queue
+            self.recording = recording
         }
     }
 
@@ -202,6 +223,16 @@ public struct LSFG31 {
                       inputs: [MTLTexture?], outputs: [MTLTexture], groups: (Int, Int)) {
             precondition(inputs.count <= 16 && outputs.count <= 15, "binding table overflow in \(name)")
             let k = kernels[LSFG31Shaders.id(name, fp16: fp16, performance: performance)]
+            if sink.recording {
+                var textures = [MTLTexture?](repeating: nil, count: 16 + outputs.count)
+                for (i, t) in inputs.enumerated() { textures[i] = t ?? dummy }
+                for (i, t) in outputs.enumerated() { textures[16 + i] = t }
+                sink.steps.append(Step(pipeline: k.pipeline, threads: k.threadgroupSize,
+                                       groups: MTLSize(width: groups.0, height: groups.1, depth: 1),
+                                       constants: constants ?? [], samplers: samplers, textures: textures,
+                                       barrierAfter: false))
+                return
+            }
             var own: MTLCommandBuffer?
             let enc: MTLComputeCommandEncoder
             if let shared = sink.shared {
@@ -227,7 +258,14 @@ public struct LSFG31 {
 
         /// Everything dispatched so far finishes (and its writes are visible) before anything after.
         /// The shared encoder is concurrent, so passes between barriers may overlap on the GPU.
-        func barrier() { sink.shared?.memoryBarrier(scope: .textures) }
+        func barrier() {
+            if sink.recording, let last = sink.steps.popLast() {
+                sink.steps.append(Step(pipeline: last.pipeline, threads: last.threads, groups: last.groups,
+                                       constants: last.constants, samplers: last.samplers, textures: last.textures,
+                                       barrierAfter: true))
+            }
+            sink.shared?.memoryBarrier(scope: .textures)
+        }
     }
 
     private func opt(_ t: [MTLTexture]) -> [MTLTexture?] { t.map { $0 } }
@@ -240,6 +278,30 @@ public struct LSFG31 {
     /// Encodes one real frame (already written to `nextInput`).
     /// With `generate: false` only the analysis passes run, which is enough to warm up history.
     public mutating func encode(into commandBuffer: MTLCommandBuffer, generate: Bool = true) throws {
+        guard let enc = commandBuffer.makeComputeCommandEncoder(dispatchType: .concurrent) else { throw LSFGError.metal("compute encoder") }
+        let key = Int(frameIndex % 6) * 2 + (generate ? 1 : 0)
+        if plans[key] == nil {
+            let sink = Sink(shared: nil, queue: nil, recording: true)
+            encodeGraph(sink, fc: Int(frameIndex % 6), generate: generate)
+            plans[key] = sink.steps
+        }
+        for s in plans[key]! {
+            enc.setComputePipelineState(s.pipeline)
+            if !s.constants.isEmpty {
+                s.constants.withUnsafeBytes { enc.setBytes($0.baseAddress!, length: $0.count, index: 0) }
+            }
+            enc.setSamplerStates(s.samplers, range: 0..<s.samplers.count)
+            enc.setTextures(s.textures, range: 0..<s.textures.count)
+            enc.dispatchThreadgroups(s.groups, threadsPerThreadgroup: s.threads)
+            if s.barrierAfter { enc.memoryBarrier(scope: .textures) }
+        }
+        enc.endEncoding()
+        frameIndex += 1
+    }
+
+    /// Encodes the frame dispatch by dispatch, without the recorded plan (the path `encode`
+    /// used before plans). Kept to check that a replayed plan produces the same frames.
+    public mutating func encodeUnplanned(into commandBuffer: MTLCommandBuffer, generate: Bool = true) throws {
         guard let enc = commandBuffer.makeComputeCommandEncoder(dispatchType: .concurrent) else { throw LSFGError.metal("compute encoder") }
         encodeAll(Sink(shared: enc, queue: nil), generate: generate)
         enc.endEncoding()
@@ -254,8 +316,12 @@ public struct LSFG31 {
     }
 
     private mutating func encodeAll(_ sink: Sink, generate: Bool) {
+        encodeGraph(sink, fc: Int(frameIndex % 6), generate: generate) // 6 covers both the %2 and %3 rotations
+        frameIndex += 1
+    }
+
+    private func encodeGraph(_ sink: Sink, fc: Int, generate: Bool) {
         let e = Encoder(sink: sink, kernels: kernels, fp16: settings.fp16, performance: settings.performance, dummy: dummy)
-        let fc = Int(frameIndex % 6) // 6 covers both the %2 and %3 rotations
 
         // Dispatches run concurrently between barriers: independent passes (the 7 pyramid levels in
         // alpha, the gamma and delta chains at a level) overlap instead of draining the GPU after each
@@ -316,7 +382,6 @@ public struct LSFG31 {
                 e.barrier()
             }
         }
-        frameIndex += 1
     }
 
     /// Gamma chain at level `i` (coarse 0 to fine 6), step 0-4.
